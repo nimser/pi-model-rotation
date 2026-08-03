@@ -1,0 +1,28 @@
+{
+  "name": "@nimser/pi-model-rotation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Private global pi extension for quota-aware model rotation",
+  "keywords": ["pi-package"],
+  "bin": {
+    "pi-rotation-quota": "./bin/quota.ts"
+  },
+  "scripts": {
+    "test": "bash tests/run-all.sh"
+  },
+  "pi": {
+    "extensions": ["./extension/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=26"
+  }
+}
