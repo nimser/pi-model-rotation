@@ -1,7 +1,7 @@
 /**
  * model-rotation — keep an unattended run alive across rate limits.
  *
- * Two modes, switched by hand and never by the router:
+ * Two modes follow the current model; /rotation can switch them by hand:
  *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-5.6-sol → opencode-go/kimi-k3
  *   casual    openai-codex/gpt-5.6-luna → opencode-go/gpt-5.6-luna
  *
@@ -145,6 +145,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	/** Effort on the Anthropic scale; each hop renders it through its own offset. */
 	let ladder: ThinkingLevel = DEFAULT_CONFIG.modes.frontier.ladder;
 	let enabled = true;
+	let requestedEnabled = true;
 	/** key -> epoch ms until which the entry is considered rate limited */
 	const cooldownUntil = new Map<string, number>();
 	let rotations = 0;
@@ -159,16 +160,18 @@ export default function modelRotation(pi: ExtensionAPI) {
 	}
 
 	function restoreState(ctx: ExtensionContext): void {
-		enabled = true;
-		mode = "frontier";
+		requestedEnabled = true;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== "model-rotation-state") continue;
-			const data = entry.data as { enabled?: unknown; mode?: unknown } | undefined;
-			if (typeof data?.enabled === "boolean") enabled = data.enabled;
-			if (data?.mode === "frontier" || data?.mode === "casual") mode = data.mode;
+			const data = entry.data as { enabled?: unknown } | undefined;
+			if (typeof data?.enabled === "boolean") requestedEnabled = data.enabled;
 		}
+		const detected = modeForModel(ctx.model);
+		mode = detected ?? "frontier";
 		chain = usableChain(mode);
 		ladder = config.modes[mode].ladder;
+		enabled = requestedEnabled && detected !== undefined;
+		if (!detected && ctx.model) console.error(`[model-rotation] ${key(ctx.model.provider, ctx.model.id)} is unsupported; rotation disabled`);
 	}
 
 	function usableChain(name: Mode): ChainEntry[] {
@@ -181,6 +184,27 @@ export default function modelRotation(pi: ExtensionAPI) {
 		});
 		if (usable.length < 2) console.error(`[model-rotation] ${name} chain has fewer than 2 usable hops`);
 		return usable;
+	}
+
+	function modeForModel(model: { provider: string; id: string } | undefined): Mode | undefined {
+		if (!model) return undefined;
+		const matches = (Object.keys(config.modes) as Mode[]).filter((name) => usableChain(name).some((entry) => entry.provider === model.provider && entry.model === model.id));
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	function syncModeToModel(model: { provider: string; id: string } | undefined, ctx: ExtensionContext): void {
+		const detected = modeForModel(model);
+		if (!detected) {
+			enabled = false;
+			updateStatus(ctx);
+			if (model) console.error(`[model-rotation] ${key(model.provider, model.id)} is unsupported; rotation disabled`);
+			return;
+		}
+		if (detected !== mode) ladder = config.modes[detected].ladder;
+		mode = detected;
+		chain = usableChain(detected);
+		enabled = requestedEnabled;
+		updateStatus(ctx);
 	}
 
 	function thinkingFor(entry: ChainEntry): ThinkingLevel {
@@ -250,7 +274,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 		if (next !== mode) ladder = config.modes[next].ladder;
 		mode = next;
 		chain = usableChain(next);
-		pi.appendEntry("model-rotation-state", { enabled, mode });
+		pi.appendEntry("model-rotation-state", { enabled: requestedEnabled, mode });
 		updateStatus(ctx);
 	}
 
@@ -298,6 +322,10 @@ export default function modelRotation(pi: ExtensionAPI) {
 		config = loadConfig(ctx.cwd);
 		restoreState(ctx);
 		updateStatus(ctx);
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		syncModeToModel(event.model, ctx);
 	});
 
 	// Layer 1: the HTTP status, seen before pi consumes the stream.
@@ -381,9 +409,10 @@ export default function modelRotation(pi: ExtensionAPI) {
 	pi.registerCommand("rotation-toggle", {
 		description: "Enable or disable model rotation for this session",
 		handler: async (_args, ctx) => {
-			enabled = !enabled;
+			requestedEnabled = !requestedEnabled;
+			enabled = requestedEnabled && modeForModel(ctx.model) !== undefined;
 			pendingResume = undefined;
-			pi.appendEntry("model-rotation-state", { enabled, mode });
+			pi.appendEntry("model-rotation-state", { enabled: requestedEnabled, mode });
 			updateStatus(ctx);
 			if (ctx.hasUI) ctx.ui.notify(`model rotation ${enabled ? "enabled" : "disabled"}`, enabled ? "info" : "warning");
 			else console.error(`[model-rotation] ${enabled ? "enabled" : "disabled"}`);

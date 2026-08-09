@@ -9,9 +9,11 @@ Private global pi package for quota-aware model rotation across the shared host 
 | `frontier` | `anthropic/claude-opus-5` → `openai-codex/gpt-5.6-sol` | `opencode-go/kimi-k3` |
 | `casual` | `openai-codex/gpt-5.6-luna` | `opencode-go/gpt-5.6-luna` |
 
-Switch with `/rotation frontier` or `/rotation casual`; the footer shows the
-active mode. opencode-go is the last resort of its mode and is picked only once
-every other hop is out of quota or cooling down from a 429. A 429 on Go while
+The current model selects the mode at session start and whenever the model
+changes. A model in neither chain disables rotation. Switch with `/rotation
+frontier` or `/rotation casual`; the footer shows the active mode. opencode-go
+is the last resort of its mode and is picked only once every other hop is out of
+quota or cooling down from a 429. A 429 on Go while
 the OpenAI plan is also spent drops casual back to frontier — nothing ever
 promotes frontier to casual.
 

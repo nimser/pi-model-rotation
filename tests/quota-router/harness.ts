@@ -183,6 +183,7 @@ async function routingCase(): Promise<string[]> {
 	const ctx = {
 		cwd: REPO,
 		hasUI: true,
+		model: { provider: "anthropic", id: "claude-opus-5" },
 		ui: {
 			setStatus(_key: string, value: string) { statuses.push(value); },
 			notify(value: string) { notices.push(value); },
@@ -209,18 +210,19 @@ async function routingCase(): Promise<string[]> {
 }
 
 /** A fake session that records what rotation does to the model and its effort. */
-function fakeSession() {
+function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5" }, branch: unknown[] = []) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
 	const statuses: string[] = [];
 	const notices: string[] = [];
+	let setModelCalls = 0;
 	const ctx: any = {
 		cwd: join(REPO, "tests"),
 		hasUI: true,
-		model: undefined,
+		model: initialModel,
 		thinkingLevel: undefined,
 		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
-		sessionManager: { getBranch: () => [], getLeafId: () => "leaf" },
+		sessionManager: { getBranch: () => branch, getLeafId: () => "leaf" },
 		isIdle: () => true,
 		hasPendingMessages: () => false,
 		ui: { setStatus: (_k: string, value: string) => statuses.push(value), notify: (value: string) => notices.push(value) },
@@ -230,6 +232,7 @@ function fakeSession() {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		appendEntry: () => {},
 		setModel: async (model: any) => {
+			setModelCalls++;
 			ctx.model = model;
 			return true;
 		},
@@ -243,13 +246,14 @@ function fakeSession() {
 		await new Promise((resolve) => setTimeout(resolve, 2100)); // the rotate debounce coalesces one 429
 		await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
 	};
-	return { ctx, commands, handlers, statuses, notices, at, limit };
+	return { ctx, commands, handlers, statuses, notices, at, limit, setModelCalls: () => setModelCalls };
 }
 
 async function modeCase(): Promise<string[]> {
 	const failures: string[] = [];
 
-	const frontier = fakeSession();
+	const frontier = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	if (frontier.statuses[0] !== "rotation: frontier") failures.push(`frontier model did not select frontier mode: ${frontier.statuses[0]}`);
 	await frontier.commands.get("rotation")?.handler("frontier", frontier.ctx);
 	if (frontier.at() !== "anthropic/claude-opus-5:medium") failures.push(`frontier did not start on opus at medium: ${frontier.at()}`);
 	frontier.ctx.thinkingLevel = "high"; // a manual bump the ladder must read back
@@ -259,7 +263,8 @@ async function modeCase(): Promise<string[]> {
 	if (frontier.at() !== "opencode-go/kimi-k3:max") failures.push(`go was not the frontier last resort: ${frontier.at()}`);
 	if (frontier.statuses.includes("rotation: casual")) failures.push("rotation promoted itself to casual");
 
-	const casual = fakeSession();
+	const casual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
+	if (casual.statuses[0] !== "rotation: casual") failures.push(`casual model did not select casual mode: ${casual.statuses[0]}`);
 	await casual.commands.get("rotation")?.handler("casual", casual.ctx);
 	if (casual.at() !== "openai-codex/gpt-5.6-luna:xhigh") failures.push(`casual did not overwrite effort to xhigh: ${casual.at()}`);
 	casual.ctx.thinkingLevel = "high"; // inside casual the level travels untouched
@@ -268,6 +273,27 @@ async function modeCase(): Promise<string[]> {
 	await casual.limit();
 	if (casual.at() !== "anthropic/claude-opus-5:medium") failures.push(`spent casual did not fall back to frontier: ${casual.at()}`);
 	if (casual.statuses.at(-1) !== "rotation: frontier") failures.push(`mode was not reported as frontier: ${casual.statuses.at(-1)}`);
+
+	const restored = fakeSession(
+		{ provider: "anthropic", id: "claude-opus-5" },
+		[{ type: "custom", customType: "model-rotation-state", data: { enabled: true, mode: "casual" } }],
+	);
+	if (restored.statuses[0] !== "rotation: frontier") failures.push(`persisted casual mode overrode the frontier model: ${restored.statuses[0]}`);
+
+	const unsupported = fakeSession({ provider: "openai-codex", id: "unsupported-model" });
+	if (unsupported.statuses[0] !== "rotation: off") failures.push(`unsupported model did not disable rotation: ${unsupported.statuses[0]}`);
+	await unsupported.handlers.get("after_provider_response")?.({ status: 429, headers: {} }, unsupported.ctx);
+	if (unsupported.setModelCalls() !== 0) failures.push("unsupported model still rotated after a 429");
+
+	const changing = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	const casualModel = { provider: "openai-codex", id: "gpt-5.6-luna" };
+	changing.ctx.model = casualModel;
+	await changing.handlers.get("model_select")?.({ model: casualModel }, changing.ctx);
+	if (changing.statuses.at(-1) !== "rotation: casual") failures.push(`model selection did not switch to casual: ${changing.statuses.at(-1)}`);
+	const unsupportedModel = { provider: "openai-codex", id: "unsupported-model" };
+	changing.ctx.model = unsupportedModel;
+	await changing.handlers.get("model_select")?.({ model: unsupportedModel }, changing.ctx);
+	if (changing.statuses.at(-1) !== "rotation: off") failures.push(`model selection did not disable unsupported rotation: ${changing.statuses.at(-1)}`);
 	return failures;
 }
 
