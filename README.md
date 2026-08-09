@@ -15,7 +15,7 @@ Use `/rotation-toggle` to disable or re-enable rotation for the current session.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.3.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.4.0
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
@@ -33,26 +33,33 @@ Environment overrides:
 - `MODEL_ROTATION_IGNORE_CSWAP_USAGE`
 - `MODEL_ROTATION_ANTHROPIC_USAGE_URL`
 - `MODEL_ROTATION_OPENAI_USAGE_URL`
-- `MODEL_ROTATION_OPENCODE_CONSOLE_URL`
+- `MODEL_ROTATION_OPENCODE_URL`
 - `MODEL_ROTATION_OPENCODE_AUTH`
+- `MODEL_ROTATION_OPENCODE_WORKSPACE`
 - `MODEL_ROTATION_PI_AUTH`
 
 The default cache is shared at `~/.pi/agent/cache/model-rotation/quota.json`.
 
 ## OpenCode Go quota
 
-The Zen API key buys inference, not usage figures. Go meters (5-hour, calendar
-week, product period — dollar budgets, not token counts) come from the console
-API, which needs its own device-code authorization, done once per shared
-`~/.pi/agent`:
+The Zen/Go API key buys inference and nothing else — no usage route answers it,
+and a completion response carries no rate-limit header. The three Go budgets
+(rolling five hours $12, calendar week $30, paid month $60) are only served to a
+signed-in browser session, in the page behind *Go* in the workspace.
 
-```bash
-node bin/opencode-login.ts   # or /rotation-login-opencode inside a session
-```
+So the poller borrows that session, once per shared `~/.pi/agent`:
 
-Approve the printed code in a browser signed in to the OpenCode account. Tokens
-land in `~/.pi/agent/model-rotation-opencode.json` (mode 0600) and refresh
-themselves; until then opencode-go reports as unreachable and never routes.
+1. sign in at <https://opencode.ai/auth>,
+2. copy the value of the `auth` cookie for `opencode.ai` (it is `httpOnly`:
+   DevTools → Application → Cookies, not `document.cookie`),
+3. `/rotation-login-opencode <cookie>` in a session, or
+   `node bin/opencode-login.ts <cookie>`.
+
+The cookie and the discovered workspace id land in
+`~/.pi/agent/model-rotation-opencode.json` (mode 0600); the cookie lasts a year.
+Until it is stored, and again once it expires, opencode-go reports as unreachable
+and never routes. Server-function ids are content hashes that change on every
+site deploy, so the page is read directly instead.
 
 ## Development
 

@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { agentDir, envPath, jsonRequest, safeReason } from "./http.ts";
-import { fetchGoStatus } from "./opencode.ts";
+import { fetchGoUsage } from "./opencode.ts";
 
 export interface QuotaEntry {
 	provider: string;
@@ -198,28 +198,19 @@ async function pollOpenAI(): Promise<QuotaEntry> {
 	}
 }
 
-/** Go meters are dollar budgets, in micro-cent strings; an unstarted window has no reset instant. */
-function goWindow(meter: any): { usedPercent: number; resetsAt: string } | undefined {
-	if (!meter?.resetsAt) return undefined;
-	const limit = Number(meter.limitMicroCents);
-	const remaining = Number(meter.remainingMicroCents);
-	if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(remaining)) throw new Error("go status omitted meter amounts");
-	return { usedPercent: Math.max(0, Math.min(100, ((limit - remaining) / limit) * 100)), resetsAt: iso(meter.resetsAt) };
-}
+/** Go bills three dollar budgets: $12 per rolling five hours, $30 per week, $60 per paid month. */
+const GO_WINDOWS = { rolling: "five_hour", weekly: "calendar_week", monthly: "product_period" } as const;
 
 async function pollOpencodeGo(): Promise<QuotaEntry> {
 	try {
-		const status = await fetchGoStatus();
-		const subscription = String(status?.subscriptionStatus ?? "inactive");
-		// Full meters on an unsubscribed account are not headroom: every request would bill elsewhere.
-		if (subscription !== "active" && subscription !== "grace") throw new Error(`go subscription is ${subscription}`);
+		const usage = await fetchGoUsage();
+		const now = Date.now();
 		const windows: Record<string, { usedPercent: number; resetsAt: string }> = {};
-		for (const meter of Array.isArray(status?.meters) ? status.meters : []) {
-			const window = goWindow(meter);
-			const kind = String(meter?.kind ?? "");
-			if (kind && window) windows[kind] = window;
+		for (const [name, kind] of Object.entries(GO_WINDOWS) as [keyof typeof usage, string][]) {
+			const window = usage[name];
+			if (window) windows[kind] = { usedPercent: window.usedPercent, resetsAt: new Date(now + window.resetsInSeconds * 1000).toISOString() };
 		}
-		if (!Object.keys(windows).length) throw new Error("go status carried no started meter window");
+		if (!windows.calendar_week || !windows.product_period) throw new Error("go subscription reported no weekly or monthly meter");
 		const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
 		return {
 			provider: "opencode-go",

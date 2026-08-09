@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-import { awaitDeviceApproval, opencodeAuthPath, requestDeviceCode } from "../src/opencode.ts";
+import { opencodeUrl, saveSession } from "../src/opencode.ts";
 
-const code = await requestDeviceCode();
-console.log(`Approve code ${code.userCode} at ${code.verificationUrl}`);
-await awaitDeviceApproval(code);
-console.log(`opencode console credential stored at ${opencodeAuthPath()}`);
+const given = process.argv.slice(2).join("").trim();
+if (!given) {
+	console.error(`Sign in at ${opencodeUrl()}/auth, then copy the value of the "auth" cookie for ${opencodeUrl()}:`);
+	console.error(`  ${process.argv[1]} <cookie>`);
+	process.exit(1);
+}
+console.log(`opencode session stored at ${saveSession(given)}`);

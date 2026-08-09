@@ -31,7 +31,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { awaitDeviceApproval, requestDeviceCode } from "../src/opencode.ts";
+import { opencodeUrl, saveSession } from "../src/opencode.ts";
 import { chooseRoute, readQuotas } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -281,23 +281,24 @@ export default function modelRotation(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("rotation-login-opencode", {
-		description: "Authorize quota reads on the OpenCode console (device code)",
-		handler: async (_args, ctx) => {
-			const code = await requestDeviceCode();
-			const prompt = [`Approve code ${code.userCode} at:`, code.verificationUrl];
-			if (ctx.hasUI) ctx.ui.setWidget("model-rotation", prompt);
-			else console.error(prompt.join(" "));
-			try {
-				await awaitDeviceApproval(code);
-			} catch (error) {
-				const message = `opencode console login failed: ${(error as Error).message}`;
-				if (ctx.hasUI) ctx.ui.notify(message, "error");
+		description: "Store the opencode.ai session cookie that Go quota reads need",
+		handler: async (args, ctx) => {
+			const report = (message: string, level: "info" | "error") => {
+				if (ctx.hasUI) ctx.ui.notify(message, level);
 				else console.error(message);
+			};
+			if (!args.trim()) {
+				report(`sign in at ${opencodeUrl()}/auth, then run /rotation-login-opencode <auth cookie>`, "error");
 				return;
 			}
-			await readQuotas({ refresh: true });
-			if (ctx.hasUI) ctx.ui.notify("opencode console authorized", "info");
-			else console.error("[model-rotation] opencode console authorized");
+			try {
+				saveSession(args);
+				const quotas = await readQuotas({ refresh: true });
+				const go = quotas.find((entry) => entry.provider === "opencode-go");
+				report(go?.reachable ? `opencode-go quota is readable (${go.remainingPercent?.toFixed(0)}% left)` : `opencode-go still unreadable: ${go?.reason}`, go?.reachable ? "info" : "error");
+			} catch (error) {
+				report(`opencode login failed: ${(error as Error).message}`, "error");
+			}
 		},
 	});
 

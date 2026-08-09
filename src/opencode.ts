@@ -1,35 +1,35 @@
-/** OpenCode console credentials: device-code login, token refresh, Go meter read. */
+/**
+ * OpenCode Go usage, read from the workspace page that serves it.
+ *
+ * The Zen/Go API key buys inference and nothing else: no usage route answers it.
+ * The subscription's own numbers ride in the hydration payload of
+ * `/workspace/<id>/go`, which needs the browser session cookie of a signed-in
+ * account. Server-function ids are content hashes that change on every deploy,
+ * so the page itself is the stable surface.
+ */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { agentDir, envPath, jsonRequest } from "./http.ts";
+import { agentDir, envPath, textRequest } from "./http.ts";
 
-const CLIENT_ID = "console";
-const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
-
-interface TokenStore {
-	access: string;
-	refresh: string;
-	expires: number;
-	org?: string;
+interface Session {
+	cookie: string;
+	workspace?: string;
 }
 
-export interface DeviceCode {
-	userCode: string;
-	verificationUrl: string;
-	expiresAt: number;
-	intervalMs: number;
-	deviceCode: string;
+export interface GoWindow {
+	usedPercent: number;
+	resetsInSeconds: number;
 }
 
-export function consoleUrl(): string {
-	return (process.env.MODEL_ROTATION_OPENCODE_CONSOLE_URL ?? "https://console.opencode.ai").replace(/\/+$/, "");
+export function opencodeUrl(): string {
+	return (process.env.MODEL_ROTATION_OPENCODE_URL ?? "https://opencode.ai").replace(/\/+$/, "");
 }
 
 export function opencodeAuthPath(): string {
 	return envPath("MODEL_ROTATION_OPENCODE_AUTH", join(agentDir(), "model-rotation-opencode.json"));
 }
 
-function writeStore(value: TokenStore): TokenStore {
+function writeSession(value: Session): Session {
 	const path = opencodeAuthPath();
 	mkdirSync(dirname(path), { recursive: true });
 	const temporary = `${path}.${process.pid}.tmp`;
@@ -38,67 +38,47 @@ function writeStore(value: TokenStore): TokenStore {
 	return value;
 }
 
-function readStore(): TokenStore {
-	const value = JSON.parse(readFileSync(opencodeAuthPath(), "utf8")) as TokenStore;
-	if (typeof value?.refresh !== "string" || !value.refresh) throw new Error("opencode console credential is unusable");
+function readSession(): Session {
+	const value = JSON.parse(readFileSync(opencodeAuthPath(), "utf8")) as Session;
+	if (typeof value?.cookie !== "string" || !value.cookie) throw new Error("opencode session cookie is unusable");
 	return value;
 }
 
-function fromTokenResponse(token: { access_token: string; refresh_token: string; expires_in: number }, org?: string): TokenStore {
-	return { access: token.access_token, refresh: token.refresh_token, expires: Date.now() + token.expires_in * 1000, ...(org ? { org } : {}) };
+/** Stores the `auth` cookie of a signed-in opencode.ai browser session. */
+export function saveSession(cookie: string): string {
+	const trimmed = cookie.trim().replace(/^auth=/, "");
+	if (!trimmed) throw new Error("no cookie value given");
+	writeSession({ cookie: trimmed });
+	return opencodeAuthPath();
 }
 
-async function session(): Promise<TokenStore> {
-	const current = readStore();
-	if (typeof current.access === "string" && current.access && current.expires - 60_000 > Date.now()) return current;
-	const token = await jsonRequest(`${consoleUrl()}/auth/device/token`, {}, { grant_type: "refresh_token", refresh_token: current.refresh, client_id: CLIENT_ID });
-	if (typeof token?.access_token !== "string") throw new Error("opencode console refused the refresh token");
-	return writeStore(fromTokenResponse(token, current.org));
+async function page(path: string, cookie: string): Promise<string> {
+	return await textRequest(`${opencodeUrl()}${path}`, { Cookie: `auth=${cookie}` });
 }
 
-/** Every console read is org-scoped; the id is stable, so it is stored with the tokens. */
-async function orgId(current: TokenStore): Promise<string> {
-	const configured = process.env.MODEL_ROTATION_OPENCODE_ORG ?? current.org;
+/** Any signed-in page carries the workspace id; it is stable, so it is stored. */
+async function workspaceId(session: Session): Promise<string> {
+	const configured = process.env.MODEL_ROTATION_OPENCODE_WORKSPACE ?? session.workspace;
 	if (configured) return configured;
-	const orgs = await jsonRequest(`${consoleUrl()}/api/orgs`, { Authorization: `Bearer ${current.access}` });
-	const id = (Array.isArray(orgs) ? orgs : []).map((org) => org?.id).find((value) => typeof value === "string" && value);
-	if (!id) throw new Error("opencode console account belongs to no organization");
-	writeStore({ ...current, org: id });
+	const id = /wrk_[A-Z0-9]+/.exec(await page("/go/", session.cookie))?.[0];
+	if (!id) throw new Error("opencode session is signed out or has no workspace");
+	writeSession({ ...session, workspace: id });
 	return id;
 }
 
-/** Raw `GET /api/go/status`: subscription state plus one meter per usage window. */
-export async function fetchGoStatus(): Promise<any> {
-	const current = await session();
-	return await jsonRequest(`${consoleUrl()}/api/go/status`, { Authorization: `Bearer ${current.access}`, "x-org-id": await orgId(current) });
-}
+const WINDOWS = { rolling: "rollingUsage", weekly: "weeklyUsage", monthly: "monthlyUsage" } as const;
 
-export async function requestDeviceCode(): Promise<DeviceCode> {
-	const body = await jsonRequest(`${consoleUrl()}/auth/device/code`, {}, { client_id: CLIENT_ID });
-	const complete = String(body?.verification_uri_complete ?? body?.verification_uri ?? "");
-	if (typeof body?.device_code !== "string" || !complete) throw new Error("opencode console refused the device code request");
-	return {
-		deviceCode: body.device_code,
-		userCode: String(body.user_code ?? ""),
-		verificationUrl: complete.startsWith("http") ? complete : `${consoleUrl()}${complete}`,
-		expiresAt: Date.now() + Number(body.expires_in ?? 900) * 1000,
-		intervalMs: Math.max(1, Number(body.interval ?? 5)) * 1000,
-	};
-}
-
-/** Polls until the user approves the code in a browser, then stores the tokens. */
-export async function awaitDeviceApproval(code: DeviceCode): Promise<void> {
-	while (Date.now() < code.expiresAt) {
-		await new Promise((resolve) => setTimeout(resolve, code.intervalMs));
-		try {
-			const token = await jsonRequest(`${consoleUrl()}/auth/device/token`, {}, { grant_type: DEVICE_GRANT, device_code: code.deviceCode, client_id: CLIENT_ID });
-			if (typeof token?.access_token === "string") {
-				writeStore(fromTokenResponse(token));
-				return;
-			}
-		} catch {
-			/* authorization_pending answers with a 4xx until the user approves */
-		}
+/** Reads the three Go meters; `monthlyUsage` also names a billing field, so parse from the rolling anchor on. */
+export async function fetchGoUsage(): Promise<Partial<Record<keyof typeof WINDOWS, GoWindow>>> {
+	const session = readSession();
+	const html = await page(`/workspace/${await workspaceId(session)}/go`, session.cookie);
+	const anchor = html.indexOf(`${WINDOWS.rolling}:`);
+	if (anchor < 0) throw new Error("opencode workspace page carried no Go meters");
+	const block = html.slice(anchor, anchor + 800);
+	const windows: Partial<Record<keyof typeof WINDOWS, GoWindow>> = {};
+	for (const [name, field] of Object.entries(WINDOWS) as [keyof typeof WINDOWS, string][]) {
+		const match = new RegExp(`${field}:[^{]*\\{status:"(\\w+)",resetInSec:(\\d+),usagePercent:(\\d+)`).exec(block);
+		if (match?.[1] === "ok") windows[name] = { usedPercent: Number(match[3]), resetsInSeconds: Number(match[2]) };
 	}
-	throw new Error("opencode console device code expired before approval");
+	return windows;
 }

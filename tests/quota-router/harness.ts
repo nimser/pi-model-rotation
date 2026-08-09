@@ -41,7 +41,7 @@ async function cacheCase(): Promise<string[]> {
 	writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-one"));
 	writeFileSync(join(home, ".pi", "agent", "auth.json"), JSON.stringify({ "openai-codex": { access: "openai-one", accountId: "account-1" } }));
 	const opencodeAuth = join(root, "opencode.json");
-	writeFileSync(opencodeAuth, JSON.stringify({ access: "go-access-1", refresh: "go-refresh-1", expires: Date.now() - 1000 }));
+	writeFileSync(opencodeAuth, JSON.stringify({ cookie: "go-cookie" }));
 	const before = hashTree(credentials);
 	let requests = 0;
 	const reset = new Date(Date.now() + 3_600_000).toISOString();
@@ -57,25 +57,29 @@ async function cacheCase(): Promise<string[]> {
 			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 30, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
 			return;
 		}
-		if (request.url === "/auth/device/token") {
-			response.end(JSON.stringify({ access_token: "go-access-2", refresh_token: "go-refresh-2", token_type: "Bearer", expires_in: 3600 }));
-			return;
-		}
-		if (request.url === "/api/orgs") {
-			response.end(JSON.stringify([{ id: "org_test", name: "Personal", role: "owner" }]));
-			return;
-		}
-		if (request.url === "/api/go/status") {
-			if (request.headers.authorization !== "Bearer go-access-2" || request.headers["x-org-id"] !== "org_test") {
-				response.statusCode = 400;
-				response.end("{}");
+		if (request.url?.startsWith("/go") || request.url?.startsWith("/workspace/")) {
+			if (request.headers.cookie !== "auth=go-cookie") {
+				response.statusCode = 403;
+				response.end("signed out");
 				return;
 			}
-			response.end(JSON.stringify({ subscriptionStatus: "active", meters: [
-				{ kind: "five_hour", resetsAt: null, limitMicroCents: "120000000", remainingMicroCents: "120000000" },
-				{ kind: "calendar_week", resetsAt: reset, limitMicroCents: "300000000", remainingMicroCents: "60000000" },
-				{ kind: "product_period", resetsAt: reset, limitMicroCents: "600000000", remainingMicroCents: "540000000" },
-			] }));
+			response.setHeader("content-type", "text/html");
+			if (request.url === "/go/") {
+				response.end('<script>$R[6]=[{id:"wrk_TEST1",name:"Default"}]</script>');
+				return;
+			}
+			if (request.url !== "/workspace/wrk_TEST1/go") {
+				response.statusCode = 404;
+				response.end("not found");
+				return;
+			}
+			// The billing object names monthlyUsage too, ahead of the Go meters.
+			response.end(
+				'<script>$R[29]={balance:0,monthlyLimit:null,monthlyUsage:null,subscription:null};' +
+					'$R[31]={mine:!0,useBalance:!1,rollingUsage:$R[33]={status:"ok",resetInSec:600,usagePercent:10},' +
+					'weeklyUsage:$R[34]={status:"ok",resetInSec:3600,usagePercent:80},' +
+					'monthlyUsage:$R[35]={status:"ok",resetInSec:86400,usagePercent:40}}</script>',
+			);
 			return;
 		}
 		response.statusCode = 404;
@@ -93,7 +97,7 @@ async function cacheCase(): Promise<string[]> {
 		MODEL_ROTATION_IGNORE_CSWAP_USAGE: "1",
 		MODEL_ROTATION_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${address.port}/anthropic`,
 		MODEL_ROTATION_OPENAI_USAGE_URL: `http://127.0.0.1:${address.port}/openai`,
-		MODEL_ROTATION_OPENCODE_CONSOLE_URL: `http://127.0.0.1:${address.port}`,
+		MODEL_ROTATION_OPENCODE_URL: `http://127.0.0.1:${address.port}`,
 		MODEL_ROTATION_OPENCODE_AUTH: opencodeAuth,
 	};
 	try {
@@ -104,12 +108,11 @@ async function cacheCase(): Promise<string[]> {
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
 		const go = entries.find((entry) => entry.provider === "opencode-go");
-		if (go?.remainingPercent !== 20 || go.windows?.calendar_week?.usedPercent !== 80 || go.windows?.five_hour) failures.push(`go meters were not read: ${JSON.stringify(go)}`);
-		const stored = JSON.parse(readFileSync(opencodeAuth, "utf8"));
-		if (stored.refresh !== "go-refresh-2" || stored.org !== "org_test") failures.push(`opencode session was not persisted: ${JSON.stringify(stored)}`);
+		if (go?.remainingPercent !== 20 || go.windows?.calendar_week?.usedPercent !== 80 || go.windows?.product_period?.usedPercent !== 40) failures.push(`go meters were not read: ${JSON.stringify(go)}`);
+		if (JSON.parse(readFileSync(opencodeAuth, "utf8")).workspace !== "wrk_TEST1") failures.push("discovered workspace id was not persisted");
 		const afterFirst = requests;
 		const second = await runQuota(env);
-		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 6) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
+		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 5) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
 
 		const usageDir = join(home, ".local", "share", "claude-swap", "cache");
 		mkdirSync(usageDir, { recursive: true });
