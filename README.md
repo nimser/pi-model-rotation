@@ -42,7 +42,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.5.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.6.0
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
@@ -54,7 +54,6 @@ Optional project override: `.pi/model-rotation.json`.
 
 ```json
 {
-  "goPeriodStart": "2026-08-15T21:00:00Z",
   "modes": { "casual": { "ladder": "xhigh", "chain": [] } },
   "cooldownMs": { "anthropic": 300000, "default": 900000 },
   "maxResumesPerSession": 5,
@@ -71,36 +70,26 @@ Environment overrides:
 - `MODEL_ROTATION_ANTHROPIC_USAGE_URL`
 - `MODEL_ROTATION_OPENAI_USAGE_URL`
 - `MODEL_ROTATION_PI_AUTH`
-- `MODEL_ROTATION_GO_DOCS_URL`
-- `MODEL_ROTATION_GO_LEDGER`
-- `MODEL_ROTATION_GO_PRICING`
-- `MODEL_ROTATION_GO_PERIOD_START`
 
 The default cache is shared at `~/.pi/agent/cache/model-rotation/quota.json`.
 
 ## OpenCode Go quota
 
-Anthropic and OpenAI report usage over their own APIs. Go does not: the key buys
-inference only, responses carry no rate-limit header, and the workspace page
-that shows the meters needs a browser session. What Go publishes instead is
-enough to compute them.
+There is none, by design. The key buys inference only, responses carry no
+rate-limit header, and the workspace page that shows the meters needs a browser
+session, which is not a durable credential.
 
-Each model carries a monthly allowance — $15 or $60 — and the rolling five-hour
-and calendar-week windows are 20 % and 50 % of it. So a served request consumes
-`cost / allowance` of the subscription, whichever model answered, and each
-window is that share against its own fraction. Prices and allowances come from
-the Go docs table, refreshed weekly into
-`~/.pi/agent/cache/model-rotation/go-pricing.json`; every served response is
-appended to `go-ledger.jsonl` beside it with raw token counts, so a price
-correction applies to history.
+Go usage can be computed from what the subscription publishes — each model
+carries a monthly allowance of $15 or $60, and the rolling five-hour and
+calendar-week windows are 20 % and 50 % of it — but no routing decision depends
+on the answer: Go is the last resort of its mode, entered when everything else
+is spent and left on a 429 or when a plan recovers. A number that changes
+nothing is not worth a weekly parse of somebody else's docs, so `/rotation`
+prints `last resort; no usage API` instead of a figure it cannot check.
 
-The ledger only knows the traffic this shared agent home serves, and a window
-that opened before the ledger did is reported as incomplete rather than as
-fact. Go figures are therefore marked with `~`, and the routing rules never let
-an estimate promote Go above a plan that reports its own numbers.
-
-Set `goPeriodStart` to the subscription's renewal instant; without it the paid
-period is approximated by the calendar month.
+The one consequence that is handled: Go's shortest window is five rolling hours,
+so its cooldown after a 429 is five hours rather than the fifteen-minute
+default, and a `Retry-After` is believed up to a day.
 
 ## Development
 

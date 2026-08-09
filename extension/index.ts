@@ -42,7 +42,6 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { recordGoUsage } from "../src/go-ledger.ts";
 import { chooseRoute, readQuotas } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -94,7 +93,8 @@ const DEFAULT_CONFIG: RotationConfig = {
 			],
 		},
 	},
-	cooldownMs: { anthropic: 5 * 60_000, default: 15 * 60_000 },
+	// Go's shortest window is five rolling hours, so a minute-scale retry only buys another 429.
+	cooldownMs: { anthropic: 5 * 60_000, "opencode-go": 5 * 3_600_000, default: 15 * 60_000 },
 	maxResumesPerSession: 5,
 	autoResume: true,
 	rotateOnStatus: [429],
@@ -196,8 +196,9 @@ export default function modelRotation(pi: ExtensionAPI) {
 	}
 
 	function cooldownFor(provider: string, retryAfterSeconds?: number): number {
+		// A plan that names its own reset is believed, up to a day; anything longer is a bug, not a window.
 		if (retryAfterSeconds && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
-			return Math.min(retryAfterSeconds * 1000, 60 * 60_000);
+			return Math.min(retryAfterSeconds * 1000, 24 * 3_600_000);
 		}
 		return config.cooldownMs[provider] ?? config.cooldownMs.default ?? 15 * 60_000;
 	}
@@ -306,18 +307,10 @@ export default function modelRotation(pi: ExtensionAPI) {
 		await rotate(ctx, "rate limited", Number.isFinite(retryAfter) ? retryAfter : undefined);
 	});
 
-	// Layer 2: the error surfaced as a finished assistant message; a served one feeds the Go ledger.
+	// Layer 2: the error surfaced as a finished assistant message.
 	pi.on("message_end", async (event, ctx) => {
-		const message = event.message as { role: string; provider?: string; model?: string; usage?: Record<string, number>; stopReason?: string; errorMessage?: string };
-		if (message.role !== "assistant") return;
-		if (message.provider === "opencode-go" && message.model && message.usage) {
-			try {
-				recordGoUsage(message.model, message.usage);
-			} catch (error) {
-				console.error(`[model-rotation] go usage not recorded: ${(error as Error).message}`);
-			}
-		}
-		if (!enabled || message.stopReason !== "error") return;
+		const message = event.message as { role: string; stopReason?: string; errorMessage?: string };
+		if (!enabled || message.role !== "assistant" || message.stopReason !== "error") return;
 		if (!RATE_LIMIT_RE.test(message.errorMessage ?? "")) return;
 		await rotate(ctx, "rate limited");
 	});
@@ -419,7 +412,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 			const lines = quotas.map((entry) => {
 				const active = entry.active ? "→" : " ";
 				const quota = entry.reachable
-					? `${entry.estimated ? "~" : ""}${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
+					? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
 					: `unknown · ${entry.reason}`;
 				const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
 				return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;

@@ -40,12 +40,6 @@ async function cacheCase(): Promise<string[]> {
 	writeFileSync(join(credentials, ".creds-2-two.enc"), Buffer.from(oauth("anthropic-two")).toString("base64"));
 	writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-one"));
 	writeFileSync(join(home, ".pi", "agent", "auth.json"), JSON.stringify({ "openai-codex": { access: "openai-one", accountId: "account-1" } }));
-	const goPricing = join(root, "go-pricing.json");
-	const goLedger = join(root, "go-ledger.jsonl");
-	const price = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0, allowance: 15 };
-	writeFileSync(goPricing, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), models: { "kimi-k3": price } }));
-	// $3 of a $15 allowance is a fifth of the subscription: a full rolling window, 40 % of the week.
-	writeFileSync(goLedger, `${JSON.stringify({ at: Date.now(), model: "kimi-k3", input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 })}\n`);
 	const before = hashTree(credentials);
 	let requests = 0;
 	const reset = new Date(Date.now() + 3_600_000).toISOString();
@@ -77,9 +71,6 @@ async function cacheCase(): Promise<string[]> {
 		MODEL_ROTATION_IGNORE_CSWAP_USAGE: "1",
 		MODEL_ROTATION_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${address.port}/anthropic`,
 		MODEL_ROTATION_OPENAI_USAGE_URL: `http://127.0.0.1:${address.port}/openai`,
-		MODEL_ROTATION_GO_PRICING: goPricing,
-		MODEL_ROTATION_GO_LEDGER: goLedger,
-		MODEL_ROTATION_GO_DOCS_URL: `http://127.0.0.1:${address.port}/nowhere`,
 	};
 	try {
 		const [first, concurrent] = await Promise.all([runQuota(env), runQuota(env)]);
@@ -89,7 +80,7 @@ async function cacheCase(): Promise<string[]> {
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
 		const go = entries.find((entry) => entry.provider === "opencode-go");
-		if (!go?.estimated || go.usedPercent !== 100 || Math.round(go.windows?.calendar_week?.usedPercent ?? 0) !== 40) failures.push(`go ledger was not accounted: ${JSON.stringify(go)}`);
+		if (go?.reachable || !go?.reason) failures.push(`go should report as a last resort with no usage API: ${JSON.stringify(go)}`);
 		const afterFirst = requests;
 		const second = await runQuota(env);
 		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 3) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
@@ -280,34 +271,7 @@ async function modeCase(): Promise<string[]> {
 	return failures;
 }
 
-async function ledgerCase(): Promise<string[]> {
-	const failures: string[] = [];
-	const { parsePricing, readGoWindows, recordGoUsage } = await import("../../src/go-ledger.ts");
-	const docs = `<table><tr><th>Model</th><th>Model ID</th><th>Endpoint</th></tr>
-		<tr><td>Kimi K3</td><td>kimi-k3</td><td>https://opencode.ai/zen/go/v1/chat/completions</td></tr></table>
-		<table><tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Usage</th></tr>
-		<tr><td>Kimi K3</td><td>$3.00</td><td>$15.00</td><td>$0.30</td><td>-</td><td>$15</td></tr></table>`;
-	const table = parsePricing(docs);
-	if (table["kimi-k3"]?.allowance !== 15 || table["kimi-k3"]?.input !== 3) failures.push(`docs pricing was not parsed: ${JSON.stringify(table)}`);
-
-	const root = mkdtempSync(join(tmpdir(), "go-ledger-"));
-	process.env.MODEL_ROTATION_GO_LEDGER = join(root, "ledger.jsonl");
-	process.env.MODEL_ROTATION_GO_PRICING = join(root, "pricing.json");
-	process.env.MODEL_ROTATION_GO_PERIOD_START = new Date(Date.now() - 40 * 86_400_000).toISOString();
-	writeFileSync(process.env.MODEL_ROTATION_GO_PRICING, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), models: table }));
-	// One million input tokens on Kimi K3 costs $3 of a $15 allowance: a fifth of the subscription.
-	recordGoUsage("kimi-k3", { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 });
-	const windows = await readGoWindows();
-	if (Math.round(windows.rolling.usedPercent) !== 100) failures.push(`rolling window is not a fifth of the allowance: ${windows.rolling.usedPercent}`);
-	if (Math.round(windows.weekly.usedPercent) !== 40) failures.push(`weekly window is not half the allowance: ${windows.weekly.usedPercent}`);
-	if (Math.round(windows.period.usedPercent) !== 20) failures.push(`period window is not the whole allowance: ${windows.period.usedPercent}`);
-	if (!windows.rolling.complete) failures.push("a window opened by our own first request was reported incomplete");
-	if (Date.parse(windows.rolling.resetsAt) - Date.now() > 5 * 3_600_000) failures.push("rolling window resets later than five hours out");
-	rmSync(root, { recursive: true, force: true });
-	return failures;
-}
-
-const cases: Record<string, () => Promise<string[]>> = { routing: routingCase, modes: modeCase, ledger: ledgerCase };
+const cases: Record<string, () => Promise<string[]>> = { routing: routingCase, modes: modeCase };
 const selected = requested.find((name) => name in cases);
 const failures = selected ? await cases[selected]() : await cacheCase();
 if (failures.length) {

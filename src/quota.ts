@@ -4,7 +4,6 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { agentDir, envPath, jsonRequest, safeReason } from "./http.ts";
-import { readGoWindows } from "./go-ledger.ts";
 
 export interface QuotaEntry {
 	provider: string;
@@ -15,8 +14,6 @@ export interface QuotaEntry {
 	resetsAt?: string;
 	fetchedAt?: string;
 	active?: boolean;
-	/** True when the figure is computed from local accounting instead of read from the provider. */
-	estimated?: boolean;
 	burnPercentPerHour?: number;
 	forecastExhaustsAt?: string;
 	reason?: string;
@@ -200,33 +197,6 @@ async function pollOpenAI(): Promise<QuotaEntry> {
 	}
 }
 
-const GO_WINDOWS = { rolling: "five_hour", weekly: "calendar_week", period: "product_period" } as const;
-
-async function pollOpencodeGo(): Promise<QuotaEntry> {
-	try {
-		const ledger = await readGoWindows();
-		const windows: Record<string, { usedPercent: number; resetsAt: string }> = {};
-		for (const [name, kind] of Object.entries(GO_WINDOWS) as [keyof typeof ledger, string][]) {
-			windows[kind] = { usedPercent: ledger[name].usedPercent, resetsAt: ledger[name].resetsAt };
-		}
-		const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
-		return {
-			provider: "opencode-go",
-			account: "opencode-go-1",
-			reachable: true,
-			active: true,
-			estimated: true,
-			usedPercent: limiting.usedPercent,
-			remainingPercent: 100 - limiting.usedPercent,
-			resetsAt: limiting.resetsAt,
-			fetchedAt: new Date().toISOString(),
-			windows,
-		};
-	} catch (error) {
-		return { provider: "opencode-go", account: "opencode-go-1", reachable: false, active: true, reason: safeReason(error) };
-	}
-}
-
 function addForecast(entry: QuotaEntry, previous?: QuotaEntry): QuotaEntry {
 	if (!entry.reachable || entry.usedPercent === undefined || !entry.fetchedAt) return entry;
 	let burnPercentPerHour = 0;
@@ -277,9 +247,10 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 			...cached,
 			...anthropic.filter((credential) => !cachedAccounts.has(credential.account)).map(pollAnthropic),
 			pollOpenAI(),
-			pollOpencodeGo(),
 		]);
 		if (!anthropic.length) raw.unshift({ provider: "anthropic", account: "anthropic-store", reachable: false, reason: "no readable claude-swap accounts" });
+		// Go publishes no usage API; it is the last resort of its mode and the 429 is its only signal.
+		raw.push({ provider: "opencode-go", account: "opencode-go-1", reachable: false, active: true, reason: "last resort; no usage API" });
 		const entries = raw.map((entry) => addForecast(entry, prior?.entries.find((old) => old.provider === entry.provider && old.account === entry.account)));
 		writeCache({ version: 1, fetchedAt: new Date().toISOString(), entries });
 		return entries;
@@ -291,7 +262,6 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt: string } | undefined {
 	if (entry.provider === "anthropic") return entry.windows?.seven_day;
 	if (entry.provider === "openai-codex") return entry.windows?.primary;
-	if (entry.provider === "opencode-go") return entry.windows?.calendar_week;
 	return undefined;
 }
 

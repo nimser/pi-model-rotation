@@ -15,23 +15,14 @@ export function safeReason(error: unknown): string {
 	return text.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 240);
 }
 
-async function request(url: string, headers: Record<string, string>): Promise<Response> {
+export async function jsonRequest(url: string, headers: Record<string, string>): Promise<any> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 15_000);
 	try {
 		const response = await fetch(url, { headers, signal: controller.signal });
 		if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-		return response;
+		return await response.json();
 	} finally {
 		clearTimeout(timer);
 	}
-}
-
-export async function jsonRequest(url: string, headers: Record<string, string>): Promise<any> {
-	return await (await request(url, headers)).json();
-}
-
-/** Page bodies carry account details, so callers must never surface them in an error. */
-export async function textRequest(url: string, headers: Record<string, string>): Promise<string> {
-	return await (await request(url, headers)).text();
 }

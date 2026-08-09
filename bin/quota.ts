@@ -7,7 +7,7 @@ if (process.argv.includes("--json")) {
 } else {
 	for (const entry of entries) {
 		const quota = entry.reachable
-			? `${entry.estimated ? "~" : ""}${entry.usedPercent?.toFixed(1)}% used, resets ${entry.resetsAt}`
+			? `${entry.usedPercent?.toFixed(1)}% used, resets ${entry.resetsAt}`
 			: `unreachable: ${entry.reason}`;
 		console.log(`${entry.active ? "*" : " "} ${entry.provider}/${entry.account}: ${quota}`);
 	}
