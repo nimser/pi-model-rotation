@@ -32,10 +32,15 @@ run_case() {
 	mkdir -p "$workdir/.pi"
 	cat >"$workdir/.pi/model-rotation.json" <<JSON
 {
-  "chain": [
-    { "provider": "$provider", "model": "$model", "thinking": "$thinking" },
-    { "provider": "fake-healthy", "model": "always-ok" }
-  ],
+  "modes": {
+    "frontier": {
+      "ladder": "$thinking",
+      "chain": [
+        { "provider": "$provider", "model": "$model" },
+        { "provider": "fake-healthy", "model": "always-ok" }
+      ]
+    }
+  },
   "cooldownMs": { "default": 600000 },
   "maxResumesPerSession": 2,
   "autoResume": true,

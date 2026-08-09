@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { agentDir, envPath, jsonRequest, safeReason } from "./http.ts";
-import { fetchGoUsage } from "./opencode.ts";
+import { readGoWindows } from "./go-ledger.ts";
 
 export interface QuotaEntry {
 	provider: string;
@@ -15,6 +15,8 @@ export interface QuotaEntry {
 	resetsAt?: string;
 	fetchedAt?: string;
 	active?: boolean;
+	/** True when the figure is computed from local accounting instead of read from the provider. */
+	estimated?: boolean;
 	burnPercentPerHour?: number;
 	forecastExhaustsAt?: string;
 	reason?: string;
@@ -198,25 +200,22 @@ async function pollOpenAI(): Promise<QuotaEntry> {
 	}
 }
 
-/** Go bills three dollar budgets: $12 per rolling five hours, $30 per week, $60 per paid month. */
-const GO_WINDOWS = { rolling: "five_hour", weekly: "calendar_week", monthly: "product_period" } as const;
+const GO_WINDOWS = { rolling: "five_hour", weekly: "calendar_week", period: "product_period" } as const;
 
 async function pollOpencodeGo(): Promise<QuotaEntry> {
 	try {
-		const usage = await fetchGoUsage();
-		const now = Date.now();
+		const ledger = await readGoWindows();
 		const windows: Record<string, { usedPercent: number; resetsAt: string }> = {};
-		for (const [name, kind] of Object.entries(GO_WINDOWS) as [keyof typeof usage, string][]) {
-			const window = usage[name];
-			if (window) windows[kind] = { usedPercent: window.usedPercent, resetsAt: new Date(now + window.resetsInSeconds * 1000).toISOString() };
+		for (const [name, kind] of Object.entries(GO_WINDOWS) as [keyof typeof ledger, string][]) {
+			windows[kind] = { usedPercent: ledger[name].usedPercent, resetsAt: ledger[name].resetsAt };
 		}
-		if (!windows.calendar_week || !windows.product_period) throw new Error("go subscription reported no weekly or monthly meter");
 		const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
 		return {
 			provider: "opencode-go",
 			account: "opencode-go-1",
 			reachable: true,
 			active: true,
+			estimated: true,
 			usedPercent: limiting.usedPercent,
 			remainingPercent: 100 - limiting.usedPercent,
 			resetsAt: limiting.resetsAt,

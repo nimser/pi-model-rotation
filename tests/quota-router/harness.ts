@@ -40,8 +40,12 @@ async function cacheCase(): Promise<string[]> {
 	writeFileSync(join(credentials, ".creds-2-two.enc"), Buffer.from(oauth("anthropic-two")).toString("base64"));
 	writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-one"));
 	writeFileSync(join(home, ".pi", "agent", "auth.json"), JSON.stringify({ "openai-codex": { access: "openai-one", accountId: "account-1" } }));
-	const opencodeAuth = join(root, "opencode.json");
-	writeFileSync(opencodeAuth, JSON.stringify({ cookie: "go-cookie" }));
+	const goPricing = join(root, "go-pricing.json");
+	const goLedger = join(root, "go-ledger.jsonl");
+	const price = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0, allowance: 15 };
+	writeFileSync(goPricing, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), models: { "kimi-k3": price } }));
+	// $3 of a $15 allowance is a fifth of the subscription: a full rolling window, 40 % of the week.
+	writeFileSync(goLedger, `${JSON.stringify({ at: Date.now(), model: "kimi-k3", input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 })}\n`);
 	const before = hashTree(credentials);
 	let requests = 0;
 	const reset = new Date(Date.now() + 3_600_000).toISOString();
@@ -57,31 +61,7 @@ async function cacheCase(): Promise<string[]> {
 			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 30, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
 			return;
 		}
-		if (request.url?.startsWith("/go") || request.url?.startsWith("/workspace/")) {
-			if (request.headers.cookie !== "auth=go-cookie") {
-				response.statusCode = 403;
-				response.end("signed out");
-				return;
-			}
-			response.setHeader("content-type", "text/html");
-			if (request.url === "/go/") {
-				response.end('<script>$R[6]=[{id:"wrk_TEST1",name:"Default"}]</script>');
-				return;
-			}
-			if (request.url !== "/workspace/wrk_TEST1/go") {
-				response.statusCode = 404;
-				response.end("not found");
-				return;
-			}
-			// The billing object names monthlyUsage too, ahead of the Go meters.
-			response.end(
-				'<script>$R[29]={balance:0,monthlyLimit:null,monthlyUsage:null,subscription:null};' +
-					'$R[31]={mine:!0,useBalance:!1,rollingUsage:$R[33]={status:"ok",resetInSec:600,usagePercent:10},' +
-					'weeklyUsage:$R[34]={status:"ok",resetInSec:3600,usagePercent:80},' +
-					'monthlyUsage:$R[35]={status:"ok",resetInSec:86400,usagePercent:40}}</script>',
-			);
-			return;
-		}
+
 		response.statusCode = 404;
 		response.end("{}");
 	});
@@ -97,8 +77,9 @@ async function cacheCase(): Promise<string[]> {
 		MODEL_ROTATION_IGNORE_CSWAP_USAGE: "1",
 		MODEL_ROTATION_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${address.port}/anthropic`,
 		MODEL_ROTATION_OPENAI_USAGE_URL: `http://127.0.0.1:${address.port}/openai`,
-		MODEL_ROTATION_OPENCODE_URL: `http://127.0.0.1:${address.port}`,
-		MODEL_ROTATION_OPENCODE_AUTH: opencodeAuth,
+		MODEL_ROTATION_GO_PRICING: goPricing,
+		MODEL_ROTATION_GO_LEDGER: goLedger,
+		MODEL_ROTATION_GO_DOCS_URL: `http://127.0.0.1:${address.port}/nowhere`,
 	};
 	try {
 		const [first, concurrent] = await Promise.all([runQuota(env), runQuota(env)]);
@@ -108,11 +89,10 @@ async function cacheCase(): Promise<string[]> {
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
 		const go = entries.find((entry) => entry.provider === "opencode-go");
-		if (go?.remainingPercent !== 20 || go.windows?.calendar_week?.usedPercent !== 80 || go.windows?.product_period?.usedPercent !== 40) failures.push(`go meters were not read: ${JSON.stringify(go)}`);
-		if (JSON.parse(readFileSync(opencodeAuth, "utf8")).workspace !== "wrk_TEST1") failures.push("discovered workspace id was not persisted");
+		if (!go?.estimated || go.usedPercent !== 100 || Math.round(go.windows?.calendar_week?.usedPercent ?? 0) !== 40) failures.push(`go ledger was not accounted: ${JSON.stringify(go)}`);
 		const afterFirst = requests;
 		const second = await runQuota(env);
-		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 5) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
+		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 3) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
 
 		const usageDir = join(home, ".local", "share", "claude-swap", "cache");
 		mkdirSync(usageDir, { recursive: true });
@@ -124,7 +104,7 @@ async function cacheCase(): Promise<string[]> {
 		delete cacheOwnedEnv.MODEL_ROTATION_IGNORE_CSWAP_USAGE;
 		const beforeOwned = requests;
 		const cacheOwned = await runQuota(cacheOwnedEnv);
-		if (cacheOwned.status !== 0 || requests - beforeOwned !== 2) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
+		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
 		if (hashTree(credentials) !== before) failures.push("claude-swap credential store changed");
 	} finally {
 		await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -227,7 +207,7 @@ async function routingCase(): Promise<string[]> {
 	await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
 	await commands.get("rotation-toggle")?.handler("", ctx);
 	if (setModelCalls !== 0) failures.push("disabled rotation still reacted to a 429");
-	if (JSON.stringify(statuses) !== JSON.stringify(["rotation: on", "rotation: off", "rotation: on"])) failures.push(`toggle status feedback is wrong: ${JSON.stringify(statuses)}`);
+	if (JSON.stringify(statuses) !== JSON.stringify(["rotation: frontier", "rotation: off", "rotation: frontier"])) failures.push(`toggle status feedback is wrong: ${JSON.stringify(statuses)}`);
 	if (!notices.includes("model rotation disabled") || !notices.includes("model rotation enabled")) failures.push("toggle notifications do not show both states");
 	if (appended.length !== 2 || (appended[0]?.data as any)?.enabled !== false || (appended[1]?.data as any)?.enabled !== true) failures.push("toggle state was not persisted in the session");
 	ctx.sessionManager.getBranch = () => [{ type: "custom", customType: "model-rotation-state", data: { enabled: false } }];
@@ -237,7 +217,99 @@ async function routingCase(): Promise<string[]> {
 	return failures;
 }
 
-const failures = requested.includes("routing") ? await routingCase() : await cacheCase();
+/** A fake session that records what rotation does to the model and its effort. */
+function fakeSession() {
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
+	const statuses: string[] = [];
+	const notices: string[] = [];
+	const ctx: any = {
+		cwd: join(REPO, "tests"),
+		hasUI: true,
+		model: undefined,
+		thinkingLevel: undefined,
+		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
+		sessionManager: { getBranch: () => [], getLeafId: () => "leaf" },
+		isIdle: () => true,
+		hasPendingMessages: () => false,
+		ui: { setStatus: (_k: string, value: string) => statuses.push(value), notify: (value: string) => notices.push(value) },
+	};
+	const pi: any = {
+		on: (name: string, handler: any) => handlers.set(name, handler),
+		registerCommand: (name: string, command: any) => commands.set(name, command),
+		appendEntry: () => {},
+		setModel: async (model: any) => {
+			ctx.model = model;
+			return true;
+		},
+		setThinkingLevel: (level: string) => (ctx.thinkingLevel = level),
+		sendMessage: () => {},
+	};
+	modelRotation(pi);
+	handlers.get("session_start")?.({}, ctx);
+	const at = () => `${ctx.model?.provider}/${ctx.model?.id}:${ctx.thinkingLevel}`;
+	const limit = async () => {
+		await new Promise((resolve) => setTimeout(resolve, 2100)); // the rotate debounce coalesces one 429
+		await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
+	};
+	return { ctx, commands, handlers, statuses, notices, at, limit };
+}
+
+async function modeCase(): Promise<string[]> {
+	const failures: string[] = [];
+
+	const frontier = fakeSession();
+	await frontier.commands.get("rotation")?.handler("frontier", frontier.ctx);
+	if (frontier.at() !== "anthropic/claude-opus-5:medium") failures.push(`frontier did not start on opus at medium: ${frontier.at()}`);
+	frontier.ctx.thinkingLevel = "high"; // a manual bump the ladder must read back
+	await frontier.limit();
+	if (frontier.at() !== "openai-codex/gpt-5.6-sol:xhigh") failures.push(`opus high did not translate to sol xhigh: ${frontier.at()}`);
+	await frontier.limit();
+	if (frontier.at() !== "opencode-go/kimi-k3:max") failures.push(`go was not the frontier last resort: ${frontier.at()}`);
+	if (frontier.statuses.includes("rotation: casual")) failures.push("rotation promoted itself to casual");
+
+	const casual = fakeSession();
+	await casual.commands.get("rotation")?.handler("casual", casual.ctx);
+	if (casual.at() !== "openai-codex/gpt-5.6-luna:xhigh") failures.push(`casual did not overwrite effort to xhigh: ${casual.at()}`);
+	casual.ctx.thinkingLevel = "high"; // inside casual the level travels untouched
+	await casual.limit();
+	if (casual.at() !== "opencode-go/gpt-5.6-luna:high") failures.push(`casual pair did not keep its effort: ${casual.at()}`);
+	await casual.limit();
+	if (casual.at() !== "anthropic/claude-opus-5:medium") failures.push(`spent casual did not fall back to frontier: ${casual.at()}`);
+	if (casual.statuses.at(-1) !== "rotation: frontier") failures.push(`mode was not reported as frontier: ${casual.statuses.at(-1)}`);
+	return failures;
+}
+
+async function ledgerCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const { parsePricing, readGoWindows, recordGoUsage } = await import("../../src/go-ledger.ts");
+	const docs = `<table><tr><th>Model</th><th>Model ID</th><th>Endpoint</th></tr>
+		<tr><td>Kimi K3</td><td>kimi-k3</td><td>https://opencode.ai/zen/go/v1/chat/completions</td></tr></table>
+		<table><tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Usage</th></tr>
+		<tr><td>Kimi K3</td><td>$3.00</td><td>$15.00</td><td>$0.30</td><td>-</td><td>$15</td></tr></table>`;
+	const table = parsePricing(docs);
+	if (table["kimi-k3"]?.allowance !== 15 || table["kimi-k3"]?.input !== 3) failures.push(`docs pricing was not parsed: ${JSON.stringify(table)}`);
+
+	const root = mkdtempSync(join(tmpdir(), "go-ledger-"));
+	process.env.MODEL_ROTATION_GO_LEDGER = join(root, "ledger.jsonl");
+	process.env.MODEL_ROTATION_GO_PRICING = join(root, "pricing.json");
+	process.env.MODEL_ROTATION_GO_PERIOD_START = new Date(Date.now() - 40 * 86_400_000).toISOString();
+	writeFileSync(process.env.MODEL_ROTATION_GO_PRICING, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), models: table }));
+	// One million input tokens on Kimi K3 costs $3 of a $15 allowance: a fifth of the subscription.
+	recordGoUsage("kimi-k3", { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 });
+	const windows = await readGoWindows();
+	if (Math.round(windows.rolling.usedPercent) !== 100) failures.push(`rolling window is not a fifth of the allowance: ${windows.rolling.usedPercent}`);
+	if (Math.round(windows.weekly.usedPercent) !== 40) failures.push(`weekly window is not half the allowance: ${windows.weekly.usedPercent}`);
+	if (Math.round(windows.period.usedPercent) !== 20) failures.push(`period window is not the whole allowance: ${windows.period.usedPercent}`);
+	if (!windows.rolling.complete) failures.push("a window opened by our own first request was reported incomplete");
+	if (Date.parse(windows.rolling.resetsAt) - Date.now() > 5 * 3_600_000) failures.push("rolling window resets later than five hours out");
+	rmSync(root, { recursive: true, force: true });
+	return failures;
+}
+
+const cases: Record<string, () => Promise<string[]>> = { routing: routingCase, modes: modeCase, ledger: ledgerCase };
+const selected = requested.find((name) => name in cases);
+const failures = selected ? await cases[selected]() : await cacheCase();
 if (failures.length) {
 	for (const failure of failures) console.log(`FAIL: ${failure}`);
 	process.exit(1);

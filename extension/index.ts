@@ -1,9 +1,20 @@
 /**
  * model-rotation — keep an unattended run alive across rate limits.
  *
- * Default chain:
- *   anthropic/claude-opus-5 (high)  →  openai-codex/gpt-5.6-sol (high)
- *                                   →  opencode-go/kimi-k3 (max)
+ * Two modes, switched by hand and never by the router:
+ *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-5.6-sol → opencode-go/kimi-k3
+ *   casual    openai-codex/gpt-5.6-luna → opencode-go/gpt-5.6-luna
+ *
+ * opencode-go is the last resort of its mode: it is picked only once every other
+ * hop is out of quota or cooling down from a 429. A 429 on Go while the OpenAI
+ * plan is also spent drops casual back to frontier; nothing ever promotes
+ * frontier to casual.
+ *
+ * Effort travels as one ladder held on the Anthropic scale. gpt-5.6-sol runs one
+ * notch above claude-opus-5, so opus medium ≡ sol high, opus high ≡ sol xhigh,
+ * opus xhigh ≡ sol max, and a manual change is read back before every switch.
+ * Entering a mode resets the ladder to that mode's default; rotating inside a
+ * mode carries it.
  *
  * Rules baked in by decision:
  *   - cached quota forecasts choose the route before a provider request
@@ -22,7 +33,7 @@
  *                                 entry-bound extension continuation
  *
  * Config (optional): ~/.pi/agent/model-rotation.json or <cwd>/.pi/model-rotation.json
- *   { "chain": [{ "provider": "...", "model": "...", "thinking": "high" }],
+ *   { "modes": { "casual": { "chain": [...] } },
  *     "cooldownMs": { "anthropic": 300000, "default": 900000 },
  *     "maxResumesPerSession": 5, "autoResume": true }
  */
@@ -31,19 +42,32 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { opencodeUrl, saveSession } from "../src/opencode.ts";
+import { recordGoUsage } from "../src/go-ledger.ts";
 import { chooseRoute, readQuotas } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type Mode = "frontier" | "casual";
+
+const LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 interface ChainEntry {
 	provider: string;
 	model: string;
-	thinking?: ThinkingLevel;
+	/** Notches above the ladder, which is held on the Anthropic scale. */
+	effortOffset?: number;
+	/** Set when the hop ignores the ladder and always runs at one level. */
+	fixedThinking?: ThinkingLevel;
+	/** Picked only when every other hop of the mode is exhausted. */
+	lastResort?: boolean;
+}
+
+interface ModeConfig {
+	ladder: ThinkingLevel;
+	chain: ChainEntry[];
 }
 
 interface RotationConfig {
-	chain: ChainEntry[];
+	modes: Record<Mode, ModeConfig>;
 	cooldownMs: Record<string, number>;
 	maxResumesPerSession: number;
 	autoResume: boolean;
@@ -53,11 +77,23 @@ interface RotationConfig {
 const FORBIDDEN_PROVIDERS = ["openrouter"];
 
 const DEFAULT_CONFIG: RotationConfig = {
-	chain: [
-		{ provider: "anthropic", model: "claude-opus-5", thinking: "high" },
-		{ provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" },
-		{ provider: "opencode-go", model: "kimi-k3", thinking: "max" },
-	],
+	modes: {
+		frontier: {
+			ladder: "medium",
+			chain: [
+				{ provider: "anthropic", model: "claude-opus-5" },
+				{ provider: "openai-codex", model: "gpt-5.6-sol", effortOffset: 1 },
+				{ provider: "opencode-go", model: "kimi-k3", fixedThinking: "max", lastResort: true },
+			],
+		},
+		casual: {
+			ladder: "xhigh",
+			chain: [
+				{ provider: "openai-codex", model: "gpt-5.6-luna" },
+				{ provider: "opencode-go", model: "gpt-5.6-luna", lastResort: true },
+			],
+		},
+	},
 	cooldownMs: { anthropic: 5 * 60_000, default: 15 * 60_000 },
 	maxResumesPerSession: 5,
 	autoResume: true,
@@ -72,11 +108,16 @@ function loadConfig(cwd: string): RotationConfig {
 	for (const path of candidates) {
 		try {
 			const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RotationConfig>;
+			const modes = { ...DEFAULT_CONFIG.modes };
+			for (const name of Object.keys(modes) as Mode[]) {
+				const override = parsed.modes?.[name];
+				if (override) modes[name] = { ladder: override.ladder ?? modes[name].ladder, chain: override.chain?.length ? override.chain : modes[name].chain };
+			}
 			return {
 				...DEFAULT_CONFIG,
 				...parsed,
+				modes,
 				cooldownMs: { ...DEFAULT_CONFIG.cooldownMs, ...(parsed.cooldownMs ?? {}) },
-				chain: parsed.chain?.length ? parsed.chain : DEFAULT_CONFIG.chain,
 			};
 		} catch {
 			// missing or unreadable config: try the next candidate
@@ -89,13 +130,20 @@ function key(provider: string, model: string): string {
 	return `${provider}/${model}`;
 }
 
+function shift(level: ThinkingLevel, notches: number): ThinkingLevel {
+	return LEVELS[Math.max(0, Math.min(LEVELS.length - 1, LEVELS.indexOf(level) + notches))];
+}
+
 const installed = ((globalThis as any).__nimserModelRotation ??= new WeakSet<object>()) as WeakSet<object>;
 
 export default function modelRotation(pi: ExtensionAPI) {
 	if (installed.has(pi as object)) return;
 	installed.add(pi as object);
 	let config = DEFAULT_CONFIG;
-	let chain: ChainEntry[] = DEFAULT_CONFIG.chain;
+	let mode: Mode = "frontier";
+	let chain: ChainEntry[] = DEFAULT_CONFIG.modes.frontier.chain;
+	/** Effort on the Anthropic scale; each hop renders it through its own offset. */
+	let ladder: ThinkingLevel = DEFAULT_CONFIG.modes.frontier.ladder;
 	let enabled = true;
 	/** key -> epoch ms until which the entry is considered rate limited */
 	const cooldownUntil = new Map<string, number>();
@@ -107,16 +155,44 @@ export default function modelRotation(pi: ExtensionAPI) {
 	const blockedAfter: Record<string, number> = {};
 
 	function updateStatus(ctx: ExtensionContext): void {
-		if (ctx.hasUI) ctx.ui.setStatus("model-rotation", `rotation: ${enabled ? "on" : "off"}`);
+		if (ctx.hasUI) ctx.ui.setStatus("model-rotation", `rotation: ${enabled ? mode : "off"}`);
 	}
 
-	function restoreEnabled(ctx: ExtensionContext): void {
+	function restoreState(ctx: ExtensionContext): void {
 		enabled = true;
+		mode = "frontier";
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== "model-rotation-state") continue;
-			const value = (entry.data as { enabled?: unknown } | undefined)?.enabled;
-			if (typeof value === "boolean") enabled = value;
+			const data = entry.data as { enabled?: unknown; mode?: unknown } | undefined;
+			if (typeof data?.enabled === "boolean") enabled = data.enabled;
+			if (data?.mode === "frontier" || data?.mode === "casual") mode = data.mode;
 		}
+		chain = usableChain(mode);
+		ladder = config.modes[mode].ladder;
+	}
+
+	function usableChain(name: Mode): ChainEntry[] {
+		const usable = config.modes[name].chain.filter((entry) => {
+			if (FORBIDDEN_PROVIDERS.includes(entry.provider)) {
+				console.error(`[model-rotation] dropping forbidden provider from chain: ${entry.provider}`);
+				return false;
+			}
+			return true;
+		});
+		if (usable.length < 2) console.error(`[model-rotation] ${name} chain has fewer than 2 usable hops`);
+		return usable;
+	}
+
+	function thinkingFor(entry: ChainEntry): ThinkingLevel {
+		return entry.fixedThinking ?? shift(ladder, entry.effortOffset ?? 0);
+	}
+
+	/** Reads a manual effort change back onto the ladder before it is carried to another hop. */
+	function syncLadder(ctx: ExtensionContext): void {
+		const current = chain.find((entry) => entry.provider === ctx.model?.provider && entry.model === ctx.model?.id);
+		const level = ctx.thinkingLevel as ThinkingLevel | undefined;
+		if (!current || current.fixedThinking || !level || !LEVELS.includes(level)) return;
+		ladder = shift(level, -(current.effortOffset ?? 0));
 	}
 
 	function cooldownFor(provider: string, retryAfterSeconds?: number): number {
@@ -132,9 +208,14 @@ export default function modelRotation(pi: ExtensionAPI) {
 		return chain.findIndex((entry) => entry.provider === current.provider && entry.model === current.id);
 	}
 
+	/** A 429 is a plan verdict, not a model verdict: the whole provider cools down with the hop. */
+	function block(provider: string, model: string, until: number): void {
+		cooldownUntil.set(key(provider, model), until);
+		cooldownUntil.set(key(provider, "*"), until);
+	}
+
 	function available(entry: ChainEntry, now: number): boolean {
-		const until = cooldownUntil.get(key(entry.provider, entry.model)) ?? 0;
-		return until <= now;
+		return (cooldownUntil.get(key(entry.provider, entry.model)) ?? 0) <= now && (cooldownUntil.get(key(entry.provider, "*")) ?? 0) <= now;
 	}
 
 	async function switchTo(entry: ChainEntry, ctx: ExtensionContext, reason: string): Promise<boolean> {
@@ -149,17 +230,33 @@ export default function modelRotation(pi: ExtensionAPI) {
 			cooldownUntil.set(key(entry.provider, entry.model), Date.now() + cooldownFor(entry.provider));
 			return false;
 		}
-		if (entry.thinking) pi.setThinkingLevel(entry.thinking);
+		const thinking = thinkingFor(entry);
+		pi.setThinkingLevel(thinking);
 		lastRotationAt = Date.now();
 		pi.appendEntry("model-rotation", {
 			to: key(entry.provider, entry.model),
-			thinking: entry.thinking ?? null,
+			thinking,
+			mode,
 			reason,
 			at: new Date().toISOString(),
 		});
-		if (ctx.hasUI) ctx.ui.notify(`model-rotation → ${key(entry.provider, entry.model)} (${reason})`, "warning");
-		console.error(`[model-rotation] → ${key(entry.provider, entry.model)} (${reason})`);
+		if (ctx.hasUI) ctx.ui.notify(`model-rotation → ${key(entry.provider, entry.model)}:${thinking} (${reason})`, "warning");
+		console.error(`[model-rotation] → ${key(entry.provider, entry.model)}:${thinking} (${reason})`);
 		return true;
+	}
+
+	function setMode(next: Mode, ctx: ExtensionContext): void {
+		if (next !== mode) ladder = config.modes[next].ladder;
+		mode = next;
+		chain = usableChain(next);
+		pi.appendEntry("model-rotation-state", { enabled, mode });
+		updateStatus(ctx);
+	}
+
+	/** Hops of the mode in preference order: the last resort trails everything else. */
+	function hops(now: number, skip?: ChainEntry): { normal: ChainEntry[]; lastResort: ChainEntry[] } {
+		const usable = chain.filter((entry) => entry !== skip && available(entry, now));
+		return { normal: usable.filter((entry) => !entry.lastResort), lastResort: usable.filter((entry) => entry.lastResort) };
 	}
 
 	/** Mark the active model as limited and move to the next usable hop. */
@@ -167,18 +264,24 @@ export default function modelRotation(pi: ExtensionAPI) {
 		const now = Date.now();
 		// Debounce: several handlers can observe the same 429.
 		if (now - lastRotationAt < 2000) return false;
+		syncLadder(ctx);
 
 		const current = ctx.model;
-		const currentIndex = indexOfCurrent(ctx);
+		const currentEntry = chain[indexOfCurrent(ctx)];
 		if (current) {
-			cooldownUntil.set(key(current.provider, current.id), now + cooldownFor(current.provider, retryAfterSeconds));
+			block(current.provider, current.id, now + cooldownFor(current.provider, retryAfterSeconds));
 			blockedAfter[current.provider] = now;
 		}
 
-		const order = currentIndex >= 0 ? [...chain.slice(currentIndex + 1), ...chain.slice(0, currentIndex)] : chain;
-		for (const entry of order) {
-			if (!available(entry, now)) continue;
-			if (current && entry.provider === current.provider && entry.model === current.id) continue;
+		// Casual is a loan: spending its last resort while OpenAI is also out returns the session to frontier.
+		if (mode === "casual" && currentEntry?.lastResort && !hops(now).normal.length) {
+			setMode("frontier", ctx);
+			console.error("[model-rotation] casual exhausted → frontier");
+			if (ctx.hasUI) ctx.ui.notify("model-rotation: casual exhausted → frontier", "warning");
+		}
+
+		const { normal, lastResort } = hops(now, currentEntry);
+		for (const entry of [...normal, ...lastResort]) {
 			if (await switchTo(entry, ctx, reason)) {
 				rotations += 1;
 				pendingResume = config.autoResume ? { leaf: ctx.sessionManager.getLeafId(), to: key(entry.provider, entry.model) } : undefined;
@@ -192,15 +295,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
-		restoreEnabled(ctx);
-		chain = config.chain.filter((entry) => {
-			if (FORBIDDEN_PROVIDERS.includes(entry.provider)) {
-				console.error(`[model-rotation] dropping forbidden provider from chain: ${entry.provider}`);
-				return false;
-			}
-			return true;
-		});
-		if (chain.length < 2) console.error("[model-rotation] chain has fewer than 2 usable hops");
+		restoreState(ctx);
 		updateStatus(ctx);
 	});
 
@@ -211,11 +306,18 @@ export default function modelRotation(pi: ExtensionAPI) {
 		await rotate(ctx, "rate limited", Number.isFinite(retryAfter) ? retryAfter : undefined);
 	});
 
-	// Layer 2: the error surfaced as a finished assistant message.
+	// Layer 2: the error surfaced as a finished assistant message; a served one feeds the Go ledger.
 	pi.on("message_end", async (event, ctx) => {
-		if (!enabled) return;
-		const message = event.message as { role: string; stopReason?: string; errorMessage?: string };
-		if (message.role !== "assistant" || message.stopReason !== "error") return;
+		const message = event.message as { role: string; provider?: string; model?: string; usage?: Record<string, number>; stopReason?: string; errorMessage?: string };
+		if (message.role !== "assistant") return;
+		if (message.provider === "opencode-go" && message.model && message.usage) {
+			try {
+				recordGoUsage(message.model, message.usage);
+			} catch (error) {
+				console.error(`[model-rotation] go usage not recorded: ${(error as Error).message}`);
+			}
+		}
+		if (!enabled || message.stopReason !== "error") return;
 		if (!RATE_LIMIT_RE.test(message.errorMessage ?? "")) return;
 		await rotate(ctx, "rate limited");
 	});
@@ -255,14 +357,29 @@ export default function modelRotation(pi: ExtensionAPI) {
 		if (!enabled || indexOfCurrent(ctx) < 0) return;
 		try {
 			const quotas = await readQuotas();
-			const choice = chooseRoute(quotas, {
+			const now = Date.now();
+			const { normal, lastResort } = hops(now);
+			const options = {
 				currentProvider: ctx.model?.provider,
 				taskMinutes: Number(process.env.MODEL_ROTATION_TASK_MINUTES ?? process.env.METAGROWTH_BUDGET_MINUTES ?? 60),
 				blockedAfter,
-			});
-			if (!choice || choice.provider === ctx.model?.provider) return;
-			const target = chain.find((entry) => entry.provider === choice.provider);
-			if (target) await switchTo(target, ctx, choice.reason);
+			};
+			const normalProviders = new Set(normal.map((entry) => entry.provider));
+			let choice = chooseRoute(quotas.filter((entry) => normalProviders.has(entry.provider)), options);
+			let target = choice && normal.find((entry) => entry.provider === choice?.provider);
+			// The last resort waits for proof, not for silence: every other hop must answer and be spent.
+			if (!target && lastResort.length) {
+				const spent = chain
+					.filter((entry) => !entry.lastResort)
+					.every((entry) => !available(entry, now) || quotas.some((quota) => quota.provider === entry.provider && quota.reachable));
+				if (spent) {
+					target = lastResort[0];
+					choice = { provider: target.provider, account: "", projectedRemainingPercent: 0, reason: "last resort" };
+				}
+			}
+			if (!target || !choice || (target.provider === ctx.model?.provider && target.model === ctx.model?.id)) return;
+			syncLadder(ctx);
+			await switchTo(target, ctx, choice.reason);
 		} catch (error) {
 			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
 		}
@@ -273,48 +390,41 @@ export default function modelRotation(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			enabled = !enabled;
 			pendingResume = undefined;
-			pi.appendEntry("model-rotation-state", { enabled });
+			pi.appendEntry("model-rotation-state", { enabled, mode });
 			updateStatus(ctx);
 			if (ctx.hasUI) ctx.ui.notify(`model rotation ${enabled ? "enabled" : "disabled"}`, enabled ? "info" : "warning");
 			else console.error(`[model-rotation] ${enabled ? "enabled" : "disabled"}`);
 		},
 	});
 
-	pi.registerCommand("rotation-login-opencode", {
-		description: "Store the opencode.ai session cookie that Go quota reads need",
+	pi.registerCommand("rotation", {
+		description: "Show quota and routing state, or switch mode: /rotation [frontier|casual]",
 		handler: async (args, ctx) => {
-			const report = (message: string, level: "info" | "error") => {
-				if (ctx.hasUI) ctx.ui.notify(message, level);
-				else console.error(message);
-			};
-			if (!args.trim()) {
-				report(`sign in at ${opencodeUrl()}/auth, then run /rotation-login-opencode <auth cookie>`, "error");
+			const requested = args.trim().toLowerCase();
+			if (requested === "frontier" || requested === "casual") {
+				setMode(requested as Mode, ctx);
+				const now = Date.now();
+				const { normal, lastResort } = hops(now);
+				const target = [...normal, ...lastResort][0];
+				if (target) await switchTo(target, ctx, `${requested} mode`);
 				return;
 			}
-			try {
-				saveSession(args);
-				const quotas = await readQuotas({ refresh: true });
-				const go = quotas.find((entry) => entry.provider === "opencode-go");
-				report(go?.reachable ? `opencode-go quota is readable (${go.remainingPercent?.toFixed(0)}% left)` : `opencode-go still unreadable: ${go?.reason}`, go?.reachable ? "info" : "error");
-			} catch (error) {
-				report(`opencode login failed: ${(error as Error).message}`, "error");
+			if (requested) {
+				const message = `unknown mode "${requested}"; use frontier or casual`;
+				if (ctx.hasUI) ctx.ui.notify(message, "error");
+				else console.error(message);
+				return;
 			}
-		},
-	});
-
-	pi.registerCommand("rotation", {
-		description: "Show subscription quota and routing state",
-		handler: async (_args, ctx) => {
 			const quotas = await readQuotas();
 			const lines = quotas.map((entry) => {
 				const active = entry.active ? "→" : " ";
 				const quota = entry.reachable
-					? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
+					? `${entry.estimated ? "~" : ""}${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
 					: `unknown · ${entry.reason}`;
 				const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
 				return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;
 			});
-			lines.push(`state: ${enabled ? "on" : "off"} · rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
+			lines.push(`mode: ${mode} · effort: ${ladder} · state: ${enabled ? "on" : "off"} · rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
 			if (ctx.hasUI) ctx.ui.setWidget("model-rotation", lines);
 			else console.error(lines.join("\n"));
 		},
