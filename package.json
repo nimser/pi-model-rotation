@@ -1,12 +1,13 @@
 {
   "name": "@nimser/pi-model-rotation",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Private global pi extension for quota-aware model rotation",
   "keywords": ["pi-package"],
   "bin": {
-    "pi-rotation-quota": "./bin/quota.ts"
+    "pi-rotation-quota": "./bin/quota.ts",
+    "pi-rotation-opencode-login": "./bin/opencode-login.ts"
   },
   "scripts": {
     "test": "bash tests/run-all.sh"

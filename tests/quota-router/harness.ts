@@ -40,6 +40,8 @@ async function cacheCase(): Promise<string[]> {
 	writeFileSync(join(credentials, ".creds-2-two.enc"), Buffer.from(oauth("anthropic-two")).toString("base64"));
 	writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-one"));
 	writeFileSync(join(home, ".pi", "agent", "auth.json"), JSON.stringify({ "openai-codex": { access: "openai-one", accountId: "account-1" } }));
+	const opencodeAuth = join(root, "opencode.json");
+	writeFileSync(opencodeAuth, JSON.stringify({ access: "go-access-1", refresh: "go-refresh-1", expires: Date.now() - 1000 }));
 	const before = hashTree(credentials);
 	let requests = 0;
 	const reset = new Date(Date.now() + 3_600_000).toISOString();
@@ -53,6 +55,27 @@ async function cacheCase(): Promise<string[]> {
 		}
 		if (request.url === "/openai") {
 			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 30, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
+			return;
+		}
+		if (request.url === "/auth/device/token") {
+			response.end(JSON.stringify({ access_token: "go-access-2", refresh_token: "go-refresh-2", token_type: "Bearer", expires_in: 3600 }));
+			return;
+		}
+		if (request.url === "/api/orgs") {
+			response.end(JSON.stringify([{ id: "org_test", name: "Personal", role: "owner" }]));
+			return;
+		}
+		if (request.url === "/api/go/status") {
+			if (request.headers.authorization !== "Bearer go-access-2" || request.headers["x-org-id"] !== "org_test") {
+				response.statusCode = 400;
+				response.end("{}");
+				return;
+			}
+			response.end(JSON.stringify({ subscriptionStatus: "active", meters: [
+				{ kind: "five_hour", resetsAt: null, limitMicroCents: "120000000", remainingMicroCents: "120000000" },
+				{ kind: "calendar_week", resetsAt: reset, limitMicroCents: "300000000", remainingMicroCents: "60000000" },
+				{ kind: "product_period", resetsAt: reset, limitMicroCents: "600000000", remainingMicroCents: "540000000" },
+			] }));
 			return;
 		}
 		response.statusCode = 404;
@@ -70,6 +93,8 @@ async function cacheCase(): Promise<string[]> {
 		MODEL_ROTATION_IGNORE_CSWAP_USAGE: "1",
 		MODEL_ROTATION_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${address.port}/anthropic`,
 		MODEL_ROTATION_OPENAI_USAGE_URL: `http://127.0.0.1:${address.port}/openai`,
+		MODEL_ROTATION_OPENCODE_CONSOLE_URL: `http://127.0.0.1:${address.port}`,
+		MODEL_ROTATION_OPENCODE_AUTH: opencodeAuth,
 	};
 	try {
 		const [first, concurrent] = await Promise.all([runQuota(env), runQuota(env)]);
@@ -78,10 +103,13 @@ async function cacheCase(): Promise<string[]> {
 		if (entries.length !== 4) failures.push(`expected four subscriptions, got ${entries.length}`);
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
-		if (!entries.some((entry) => entry.provider === "opencode-go" && !entry.reachable && entry.reason)) failures.push("unknown opencode quota was silently dropped");
+		const go = entries.find((entry) => entry.provider === "opencode-go");
+		if (go?.remainingPercent !== 20 || go.windows?.calendar_week?.usedPercent !== 80 || go.windows?.five_hour) failures.push(`go meters were not read: ${JSON.stringify(go)}`);
+		const stored = JSON.parse(readFileSync(opencodeAuth, "utf8"));
+		if (stored.refresh !== "go-refresh-2" || stored.org !== "org_test") failures.push(`opencode session was not persisted: ${JSON.stringify(stored)}`);
 		const afterFirst = requests;
 		const second = await runQuota(env);
-		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 3) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
+		if (second.status !== 0 || requests !== afterFirst || afterFirst !== 6) failures.push(`cache/lock did not bound polling: first=${afterFirst}, after=${requests}`);
 
 		const usageDir = join(home, ".local", "share", "claude-swap", "cache");
 		mkdirSync(usageDir, { recursive: true });
@@ -93,7 +121,7 @@ async function cacheCase(): Promise<string[]> {
 		delete cacheOwnedEnv.MODEL_ROTATION_IGNORE_CSWAP_USAGE;
 		const beforeOwned = requests;
 		const cacheOwned = await runQuota(cacheOwnedEnv);
-		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
+		if (cacheOwned.status !== 0 || requests - beforeOwned !== 2) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
 		if (hashTree(credentials) !== before) failures.push("claude-swap credential store changed");
 	} finally {
 		await new Promise<void>((resolve) => server.close(() => resolve()));

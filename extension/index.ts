@@ -31,6 +31,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { awaitDeviceApproval, requestDeviceCode } from "../src/opencode.ts";
 import { chooseRoute, readQuotas } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -276,6 +277,27 @@ export default function modelRotation(pi: ExtensionAPI) {
 			updateStatus(ctx);
 			if (ctx.hasUI) ctx.ui.notify(`model rotation ${enabled ? "enabled" : "disabled"}`, enabled ? "info" : "warning");
 			else console.error(`[model-rotation] ${enabled ? "enabled" : "disabled"}`);
+		},
+	});
+
+	pi.registerCommand("rotation-login-opencode", {
+		description: "Authorize quota reads on the OpenCode console (device code)",
+		handler: async (_args, ctx) => {
+			const code = await requestDeviceCode();
+			const prompt = [`Approve code ${code.userCode} at:`, code.verificationUrl];
+			if (ctx.hasUI) ctx.ui.setWidget("model-rotation", prompt);
+			else console.error(prompt.join(" "));
+			try {
+				await awaitDeviceApproval(code);
+			} catch (error) {
+				const message = `opencode console login failed: ${(error as Error).message}`;
+				if (ctx.hasUI) ctx.ui.notify(message, "error");
+				else console.error(message);
+				return;
+			}
+			await readQuotas({ refresh: true });
+			if (ctx.hasUI) ctx.ui.notify("opencode console authorized", "info");
+			else console.error("[model-rotation] opencode console authorized");
 		},
 	});
 

@@ -15,7 +15,7 @@ Use `/rotation-toggle` to disable or re-enable rotation for the current session.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.2.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.3.0
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
@@ -33,9 +33,26 @@ Environment overrides:
 - `MODEL_ROTATION_IGNORE_CSWAP_USAGE`
 - `MODEL_ROTATION_ANTHROPIC_USAGE_URL`
 - `MODEL_ROTATION_OPENAI_USAGE_URL`
+- `MODEL_ROTATION_OPENCODE_CONSOLE_URL`
+- `MODEL_ROTATION_OPENCODE_AUTH`
 - `MODEL_ROTATION_PI_AUTH`
 
 The default cache is shared at `~/.pi/agent/cache/model-rotation/quota.json`.
+
+## OpenCode Go quota
+
+The Zen API key buys inference, not usage figures. Go meters (5-hour, calendar
+week, product period — dollar budgets, not token counts) come from the console
+API, which needs its own device-code authorization, done once per shared
+`~/.pi/agent`:
+
+```bash
+node bin/opencode-login.ts   # or /rotation-login-opencode inside a session
+```
+
+Approve the printed code in a browser signed in to the OpenCode account. Tokens
+land in `~/.pi/agent/model-rotation-opencode.json` (mode 0600) and refresh
+themselves; until then opencode-go reports as unreachable and never routes.
 
 ## Development
 

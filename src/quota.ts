@@ -2,7 +2,9 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { agentDir, envPath, jsonRequest, safeReason } from "./http.ts";
+import { fetchGoStatus } from "./opencode.ts";
 
 export interface QuotaEntry {
 	provider: string;
@@ -36,14 +38,6 @@ const CACHE_MS = 180_000;
 const RESERVE_PERCENT = 10;
 const HYSTERESIS_PERCENT = 10;
 const WEEKLY_PRESSURE_HYSTERESIS = 0.1;
-
-function envPath(name: string, fallback: string): string {
-	return resolve(process.env[name] ?? fallback);
-}
-
-function agentDir(): string {
-	return resolve(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
-}
 
 function cachePath(): string {
 	return envPath("MODEL_ROTATION_QUOTA_CACHE", join(agentDir(), "cache", "model-rotation", "quota.json"));
@@ -113,23 +107,6 @@ function anthropicCredentials(): { account: string; token: string; active: boole
 		}
 	}
 	return credentials;
-}
-
-function safeReason(error: unknown): string {
-	const text = error instanceof Error ? error.message : String(error);
-	return text.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 240);
-}
-
-async function jsonRequest(url: string, headers: Record<string, string>): Promise<any> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 15_000);
-	try {
-		const response = await fetch(url, { headers, signal: controller.signal });
-		if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-		return await response.json();
-	} finally {
-		clearTimeout(timer);
-	}
 }
 
 function cachedAnthropic(credentials: { account: string; token: string; active: boolean }[]): QuotaEntry[] {
@@ -221,6 +198,45 @@ async function pollOpenAI(): Promise<QuotaEntry> {
 	}
 }
 
+/** Go meters are dollar budgets, in micro-cent strings; an unstarted window has no reset instant. */
+function goWindow(meter: any): { usedPercent: number; resetsAt: string } | undefined {
+	if (!meter?.resetsAt) return undefined;
+	const limit = Number(meter.limitMicroCents);
+	const remaining = Number(meter.remainingMicroCents);
+	if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(remaining)) throw new Error("go status omitted meter amounts");
+	return { usedPercent: Math.max(0, Math.min(100, ((limit - remaining) / limit) * 100)), resetsAt: iso(meter.resetsAt) };
+}
+
+async function pollOpencodeGo(): Promise<QuotaEntry> {
+	try {
+		const status = await fetchGoStatus();
+		const subscription = String(status?.subscriptionStatus ?? "inactive");
+		// Full meters on an unsubscribed account are not headroom: every request would bill elsewhere.
+		if (subscription !== "active" && subscription !== "grace") throw new Error(`go subscription is ${subscription}`);
+		const windows: Record<string, { usedPercent: number; resetsAt: string }> = {};
+		for (const meter of Array.isArray(status?.meters) ? status.meters : []) {
+			const window = goWindow(meter);
+			const kind = String(meter?.kind ?? "");
+			if (kind && window) windows[kind] = window;
+		}
+		if (!Object.keys(windows).length) throw new Error("go status carried no started meter window");
+		const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
+		return {
+			provider: "opencode-go",
+			account: "opencode-go-1",
+			reachable: true,
+			active: true,
+			usedPercent: limiting.usedPercent,
+			remainingPercent: 100 - limiting.usedPercent,
+			resetsAt: limiting.resetsAt,
+			fetchedAt: new Date().toISOString(),
+			windows,
+		};
+	} catch (error) {
+		return { provider: "opencode-go", account: "opencode-go-1", reachable: false, active: true, reason: safeReason(error) };
+	}
+}
+
 function addForecast(entry: QuotaEntry, previous?: QuotaEntry): QuotaEntry {
 	if (!entry.reachable || entry.usedPercent === undefined || !entry.fetchedAt) return entry;
 	let burnPercentPerHour = 0;
@@ -267,9 +283,13 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 		}
 		const cached = cachedAnthropic(anthropic);
 		const cachedAccounts = new Set(cached.map((entry) => entry.account));
-		const raw = await Promise.all([...cached, ...anthropic.filter((credential) => !cachedAccounts.has(credential.account)).map(pollAnthropic), pollOpenAI()]);
+		const raw = await Promise.all([
+			...cached,
+			...anthropic.filter((credential) => !cachedAccounts.has(credential.account)).map(pollAnthropic),
+			pollOpenAI(),
+			pollOpencodeGo(),
+		]);
 		if (!anthropic.length) raw.unshift({ provider: "anthropic", account: "anthropic-store", reachable: false, reason: "no readable claude-swap accounts" });
-		raw.push({ provider: "opencode-go", account: "opencode-go-1", reachable: false, active: true, reason: "no verified usage endpoint" });
 		const entries = raw.map((entry) => addForecast(entry, prior?.entries.find((old) => old.provider === entry.provider && old.account === entry.account)));
 		writeCache({ version: 1, fetchedAt: new Date().toISOString(), entries });
 		return entries;
@@ -281,6 +301,7 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt: string } | undefined {
 	if (entry.provider === "anthropic") return entry.windows?.seven_day;
 	if (entry.provider === "openai-codex") return entry.windows?.primary;
+	if (entry.provider === "opencode-go") return entry.windows?.calendar_week;
 	return undefined;
 }
 
