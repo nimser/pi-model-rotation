@@ -102,7 +102,7 @@ async function cacheCase(): Promise<string[]> {
 	return failures;
 }
 
-function routingCase(): string[] {
+async function routingCase(): Promise<string[]> {
 	const now = Date.now();
 	const fetchedAt = new Date(now).toISOString();
 	const resetsAt = new Date(now + 3_600_000).toISOString();
@@ -130,6 +130,28 @@ function routingCase(): string[] {
 	const inactive = chooseRoute([entry("anthropic", "a2", 99, { active: false }), entry("openai-codex", "o1", 40)]);
 	if (inactive?.provider !== "openai-codex") failures.push("router selected an account it cannot activate");
 
+	const expiry = chooseRoute([
+		entry("anthropic", "a1", 9, { burnPercentPerHour: 20, windows: {
+			five_hour: { usedPercent: 20, resetsAt: new Date(now + 4 * 3_600_000).toISOString() },
+			seven_day: { usedPercent: 91, resetsAt: new Date(now + 3_600_000).toISOString() },
+		} }),
+		entry("openai-codex", "o1", 100, { windows: {
+			primary: { usedPercent: 0, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+		} }),
+	], { currentProvider: "openai-codex" });
+	if (expiry?.provider !== "anthropic" || expiry.reason !== "weekly expiry") failures.push(`weekly quota would expire unused: ${JSON.stringify(expiry)}`);
+
+	const shortWindow = chooseRoute([
+		entry("anthropic", "a1", 50, { windows: {
+			five_hour: { usedPercent: 50, resetsAt: new Date(now + 5 * 60_000).toISOString() },
+			seven_day: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+		} }),
+		entry("openai-codex", "o1", 50, { windows: {
+			primary: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+		} }),
+	], { currentProvider: "openai-codex" });
+	if (shortWindow?.provider !== "openai-codex") failures.push("five-hour expiry incorrectly drove weekly routing");
+
 	let registrations = 0;
 	const fakePi = {
 		on() { registrations++; },
@@ -141,10 +163,50 @@ function routingCase(): string[] {
 	if (registrations !== once) failures.push("loading model-rotation twice registered duplicate handlers");
 	const source = readFileSync(join(REPO, "extension", "index.ts"), "utf8");
 	if (source.includes("sendUserMessage") || source.includes("cooldown expired")) failures.push("fake-user resume or time-only switchback remains in model-rotation");
+
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
+	const appended: Array<{ type: string; data: unknown }> = [];
+	const statuses: string[] = [];
+	const notices: string[] = [];
+	let setModelCalls = 0;
+	const togglePi = {
+		on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
+		registerCommand(name: string, command: { handler: (...args: any[]) => Promise<void> }) { commands.set(name, command); },
+		appendEntry(type: string, data: unknown) { appended.push({ type, data }); },
+		async setModel() { setModelCalls++; return true; },
+		setThinkingLevel() {},
+		sendMessage() {},
+	} as any;
+	const ctx = {
+		cwd: REPO,
+		hasUI: true,
+		ui: {
+			setStatus(_key: string, value: string) { statuses.push(value); },
+			notify(value: string) { notices.push(value); },
+		},
+		sessionManager: {
+			getBranch: () => [],
+			getLeafId: () => "leaf",
+		},
+	} as any;
+	modelRotation(togglePi);
+	handlers.get("session_start")?.({}, ctx);
+	await commands.get("rotation-toggle")?.handler("", ctx);
+	await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
+	await commands.get("rotation-toggle")?.handler("", ctx);
+	if (setModelCalls !== 0) failures.push("disabled rotation still reacted to a 429");
+	if (JSON.stringify(statuses) !== JSON.stringify(["rotation: on", "rotation: off", "rotation: on"])) failures.push(`toggle status feedback is wrong: ${JSON.stringify(statuses)}`);
+	if (!notices.includes("model rotation disabled") || !notices.includes("model rotation enabled")) failures.push("toggle notifications do not show both states");
+	if (appended.length !== 2 || (appended[0]?.data as any)?.enabled !== false || (appended[1]?.data as any)?.enabled !== true) failures.push("toggle state was not persisted in the session");
+	ctx.sessionManager.getBranch = () => [{ type: "custom", customType: "model-rotation-state", data: { enabled: false } }];
+	handlers.get("session_start")?.({}, ctx);
+	await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
+	if (statuses.at(-1) !== "rotation: off" || setModelCalls !== 0) failures.push("disabled state did not survive session restoration");
 	return failures;
 }
 
-const failures = requested.includes("routing") ? routingCase() : await cacheCase();
+const failures = requested.includes("routing") ? await routingCase() : await cacheCase();
 if (failures.length) {
 	for (const failure of failures) console.log(`FAIL: ${failure}`);
 	process.exit(1);

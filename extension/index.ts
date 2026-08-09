@@ -95,6 +95,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	installed.add(pi as object);
 	let config = DEFAULT_CONFIG;
 	let chain: ChainEntry[] = DEFAULT_CONFIG.chain;
+	let enabled = true;
 	/** key -> epoch ms until which the entry is considered rate limited */
 	const cooldownUntil = new Map<string, number>();
 	let rotations = 0;
@@ -103,6 +104,19 @@ export default function modelRotation(pi: ExtensionAPI) {
 	let pendingResume: { leaf: string | undefined; to: string } | undefined;
 	let lastRotationAt = 0;
 	const blockedAfter: Record<string, number> = {};
+
+	function updateStatus(ctx: ExtensionContext): void {
+		if (ctx.hasUI) ctx.ui.setStatus("model-rotation", `rotation: ${enabled ? "on" : "off"}`);
+	}
+
+	function restoreEnabled(ctx: ExtensionContext): void {
+		enabled = true;
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== "model-rotation-state") continue;
+			const value = (entry.data as { enabled?: unknown } | undefined)?.enabled;
+			if (typeof value === "boolean") enabled = value;
+		}
+	}
 
 	function cooldownFor(provider: string, retryAfterSeconds?: number): number {
 		if (retryAfterSeconds && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
@@ -177,6 +191,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
+		restoreEnabled(ctx);
 		chain = config.chain.filter((entry) => {
 			if (FORBIDDEN_PROVIDERS.includes(entry.provider)) {
 				console.error(`[model-rotation] dropping forbidden provider from chain: ${entry.provider}`);
@@ -185,22 +200,23 @@ export default function modelRotation(pi: ExtensionAPI) {
 			return true;
 		});
 		if (chain.length < 2) console.error("[model-rotation] chain has fewer than 2 usable hops");
-		if (ctx.hasUI) ctx.ui.setStatus("model-rotation", `chain: ${chain.map((e) => e.model).join(" → ")}`);
+		updateStatus(ctx);
 	});
 
 	// Layer 1: the HTTP status, seen before pi consumes the stream.
 	pi.on("after_provider_response", async (event, ctx) => {
-		if (!config.rotateOnStatus.includes(event.status)) return;
+		if (!enabled || !config.rotateOnStatus.includes(event.status)) return;
 		const retryAfter = Number(event.headers?.["retry-after"] ?? event.headers?.["Retry-After"]);
-		await rotate(ctx, `http ${event.status}`, Number.isFinite(retryAfter) ? retryAfter : undefined);
+		await rotate(ctx, "rate limited", Number.isFinite(retryAfter) ? retryAfter : undefined);
 	});
 
 	// Layer 2: the error surfaced as a finished assistant message.
 	pi.on("message_end", async (event, ctx) => {
+		if (!enabled) return;
 		const message = event.message as { role: string; stopReason?: string; errorMessage?: string };
 		if (message.role !== "assistant" || message.stopReason !== "error") return;
 		if (!RATE_LIMIT_RE.test(message.errorMessage ?? "")) return;
-		await rotate(ctx, `error: ${(message.errorMessage ?? "").slice(0, 120)}`);
+		await rotate(ctx, "rate limited");
 	});
 
 	// Layer 3: the run stopped; resume it on the new model.
@@ -209,6 +225,10 @@ export default function modelRotation(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		if (!enabled) {
+			pendingResume = undefined;
+			return;
+		}
 		const resume = pendingResume;
 		pendingResume = undefined;
 		if (!resume || !config.autoResume) return;
@@ -231,7 +251,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
-		if (indexOfCurrent(ctx) < 0) return;
+		if (!enabled || indexOfCurrent(ctx) < 0) return;
 		try {
 			const quotas = await readQuotas();
 			const choice = chooseRoute(quotas, {
@@ -241,10 +261,22 @@ export default function modelRotation(pi: ExtensionAPI) {
 			});
 			if (!choice || choice.provider === ctx.model?.provider) return;
 			const target = chain.find((entry) => entry.provider === choice.provider);
-			if (target) await switchTo(target, ctx, `quota: ${choice.projectedRemainingPercent}% projected headroom`);
+			if (target) await switchTo(target, ctx, choice.reason);
 		} catch (error) {
 			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
 		}
+	});
+
+	pi.registerCommand("rotation-toggle", {
+		description: "Enable or disable model rotation for this session",
+		handler: async (_args, ctx) => {
+			enabled = !enabled;
+			pendingResume = undefined;
+			pi.appendEntry("model-rotation-state", { enabled });
+			updateStatus(ctx);
+			if (ctx.hasUI) ctx.ui.notify(`model rotation ${enabled ? "enabled" : "disabled"}`, enabled ? "info" : "warning");
+			else console.error(`[model-rotation] ${enabled ? "enabled" : "disabled"}`);
+		},
 	});
 
 	pi.registerCommand("rotation", {
@@ -259,7 +291,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 				const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
 				return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;
 			});
-			lines.push(`rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
+			lines.push(`state: ${enabled ? "on" : "off"} · rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
 			if (ctx.hasUI) ctx.ui.setWidget("model-rotation", lines);
 			else console.error(lines.join("\n"));
 		},

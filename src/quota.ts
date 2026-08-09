@@ -35,6 +35,7 @@ export interface RouteChoice {
 const CACHE_MS = 180_000;
 const RESERVE_PERCENT = 10;
 const HYSTERESIS_PERCENT = 10;
+const WEEKLY_PRESSURE_HYSTERESIS = 0.1;
 
 function envPath(name: string, fallback: string): string {
 	return resolve(process.env[name] ?? fallback);
@@ -277,6 +278,12 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 	}
 }
 
+function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt: string } | undefined {
+	if (entry.provider === "anthropic") return entry.windows?.seven_day;
+	if (entry.provider === "openai-codex") return entry.windows?.primary;
+	return undefined;
+}
+
 export function chooseRoute(entries: QuotaEntry[], options: { currentProvider?: string; taskMinutes?: number; blockedAfter?: Record<string, number> } = {}): RouteChoice | undefined {
 	const hours = Math.max(0, options.taskMinutes ?? 60) / 60;
 	const now = Date.now();
@@ -286,19 +293,31 @@ export function chooseRoute(entries: QuotaEntry[], options: { currentProvider?: 
 		.filter((entry) => Date.parse(entry.fetchedAt as string) > (options.blockedAfter?.[entry.provider] ?? 0))
 		.map((entry) => {
 			const projected = (entry.remainingPercent as number) - (entry.burnPercentPerHour ?? 0) * hours * 1.2;
-			return { entry, projected };
+			const weekly = weeklyWindow(entry);
+			const hoursToWeeklyReset = weekly ? (Date.parse(weekly.resetsAt) - now) / 3_600_000 : 0;
+			const weeklyPressure = weekly && hoursToWeeklyReset > 0 ? (100 - weekly.usedPercent) / hoursToWeeklyReset : 0;
+			return { entry, projected, weeklyPressure };
 		})
-		.filter(({ projected }) => projected >= RESERVE_PERCENT)
-		.sort((a, b) => b.projected - a.projected);
+		.filter(({ projected, weeklyPressure }) => projected > 0 || weeklyPressure > 0);
 	if (!candidates.length) return undefined;
-	const best = candidates[0];
-	const current = candidates.find(({ entry }) => entry.provider === options.currentProvider);
+
+	const maxWeeklyPressure = Math.max(...candidates.map(({ weeklyPressure }) => weeklyPressure));
+	const pressureFloor = maxWeeklyPressure * (1 - WEEKLY_PRESSURE_HYSTERESIS);
+	const paced = maxWeeklyPressure > 0 ? candidates.filter(({ weeklyPressure }) => weeklyPressure >= pressureFloor) : candidates;
+	const reserved = paced.filter(({ projected }) => projected >= RESERVE_PERCENT);
+	const headroomPool = reserved.length ? reserved : paced;
+	const best = [...headroomPool].sort((a, b) => b.projected - a.projected)[0];
+	const current = headroomPool.find(({ entry }) => entry.provider === options.currentProvider);
 	const selected = current && best.projected - current.projected < HYSTERESIS_PERCENT ? current : best;
+	const currentCandidate = candidates.find(({ entry }) => entry.provider === options.currentProvider);
+	const expiryDriven = !currentCandidate
+		? selected.weeklyPressure > 0 && paced.length < candidates.length
+		: selected.entry.provider !== currentCandidate.entry.provider && selected.weeklyPressure > currentCandidate.weeklyPressure * (1 + WEEKLY_PRESSURE_HYSTERESIS);
 	return {
 		provider: selected.entry.provider,
 		account: selected.entry.account,
 		projectedRemainingPercent: Number(selected.projected.toFixed(2)),
-		reason: selected === current ? "current route retained within hysteresis" : "most projected headroom after task and reserve",
+		reason: expiryDriven ? "weekly expiry" : "quota headroom",
 	};
 }
 

@@ -8,12 +8,14 @@ Default chain:
 anthropic/claude-opus-5:high -> openai-codex/gpt-5.6-sol:high -> opencode-go/kimi-k3:max
 ```
 
-The extension forecasts cached subscription headroom before each turn and treats the first 429 as a backstop. OpenRouter is never a rotation target.
+The extension paces weekly quotas toward their reset before comparing projected headroom, while short windows remain capacity guards only. The first 429 is a backstop. OpenRouter is never a rotation target.
+
+Use `/rotation-toggle` to disable or re-enable rotation for the current session. The footer always shows `rotation: on` or `rotation: off`. `/rotation` shows quota details and routing counters.
 
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.1.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.2.0
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
