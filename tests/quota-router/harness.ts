@@ -16,9 +16,9 @@ function hashTree(root: string): string {
 	return hash.digest("hex");
 }
 
-function runQuota(env: NodeJS.ProcessEnv): Promise<{ status: number; stdout: string; stderr: string }> {
+function runQuota(env: NodeJS.ProcessEnv, args = ["--json"]): Promise<{ status: number; stdout: string; stderr: string }> {
 	return new Promise((resolve) => {
-		const child = spawn(process.execPath, [join(REPO, "bin", "quota.ts"), "--json"], { env, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(process.execPath, [join(REPO, "bin", "quota.ts"), ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		child.stdout.on("data", (chunk) => (stdout += String(chunk)));
@@ -39,6 +39,7 @@ async function cacheCase(): Promise<string[]> {
 	writeFileSync(join(credentials, ".creds-1-one.enc"), Buffer.from(oauth("anthropic-one")).toString("base64"));
 	writeFileSync(join(credentials, ".creds-2-two.enc"), Buffer.from(oauth("anthropic-two")).toString("base64"));
 	writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-one"));
+	writeFileSync(join(home, ".local", "share", "claude-swap", "sequence.json"), JSON.stringify({ activeAccountNumber: 1 }));
 	writeFileSync(join(home, ".pi", "agent", "auth.json"), JSON.stringify({ "openai-codex": { access: "openai-one", accountId: "account-1" } }));
 	const before = hashTree(credentials);
 	let requests = 0;
@@ -47,7 +48,8 @@ async function cacheCase(): Promise<string[]> {
 		requests++;
 		response.setHeader("content-type", "application/json");
 		if (request.url === "/anthropic") {
-			const used = request.headers.authorization?.includes("anthropic-one") ? 80 : 20;
+			const authorization = request.headers.authorization ?? "";
+			const used = authorization.includes("anthropic-refreshed") ? 5 : authorization.includes("anthropic-one") ? 80 : 20;
 			response.end(JSON.stringify({ five_hour: { utilization: used, resets_at: reset }, seven_day: { utilization: 10, resets_at: reset } }));
 			return;
 		}
@@ -96,6 +98,15 @@ async function cacheCase(): Promise<string[]> {
 		const beforeOwned = requests;
 		const cacheOwned = await runQuota(cacheOwnedEnv);
 		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
+
+		writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-refreshed"));
+		const beforeRefresh = requests;
+		const refreshed = await runQuota(cacheOwnedEnv, ["--json", "--refresh"]);
+		const refreshedEntries = JSON.parse(refreshed.stdout) as QuotaEntry[];
+		const refreshedActive = refreshedEntries.find((entry) => entry.account === "anthropic-1");
+		if (refreshed.status !== 0 || requests - beforeRefresh !== 3 || refreshedActive?.windows?.five_hour.usedPercent !== 5) {
+			failures.push(`forced refresh ignored the re-login (${requests - beforeRefresh} requests, ${JSON.stringify(refreshedActive)})`);
+		}
 		if (hashTree(credentials) !== before) failures.push("claude-swap credential store changed");
 	} finally {
 		await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -171,6 +182,7 @@ async function routingCase(): Promise<string[]> {
 	const appended: Array<{ type: string; data: unknown }> = [];
 	const statuses: string[] = [];
 	const notices: string[] = [];
+	const widgets: unknown[] = [];
 	let setModelCalls = 0;
 	const togglePi = {
 		on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -186,6 +198,8 @@ async function routingCase(): Promise<string[]> {
 		model: { provider: "anthropic", id: "claude-opus-5" },
 		ui: {
 			setStatus(_key: string, value: string) { statuses.push(value); },
+			setWidget(_key: string, value: unknown) { widgets.push(value); },
+			theme: { bold(value: string) { return value; } },
 			notify(value: string) { notices.push(value); },
 		},
 		sessionManager: {
@@ -195,9 +209,13 @@ async function routingCase(): Promise<string[]> {
 	} as any;
 	modelRotation(togglePi);
 	handlers.get("session_start")?.({}, ctx);
-	await commands.get("rotation-toggle")?.handler("", ctx);
+	const commandNames = ["mru", "mrt", "mrc", "mrf"];
+	if (!commandNames.every((name) => commands.has(name)) || ["rotation", "rotation-toggle"].some((name) => commands.has(name))) failures.push(`command names are wrong: ${JSON.stringify([...commands.keys()])}`);
+	await commands.get("mrt")?.handler("", ctx);
 	await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
-	await commands.get("rotation-toggle")?.handler("", ctx);
+	await commands.get("mrt")?.handler("", ctx);
+	await commands.get("mru")?.handler("hide", ctx);
+	if (widgets.at(-1) !== undefined) failures.push("usage widget did not hide");
 	if (setModelCalls !== 0) failures.push("disabled rotation still reacted to a 429");
 	if (JSON.stringify(statuses) !== JSON.stringify(["rotation: frontier", "rotation: off", "rotation: frontier"])) failures.push(`toggle status feedback is wrong: ${JSON.stringify(statuses)}`);
 	if (!notices.includes("model rotation disabled") || !notices.includes("model rotation enabled")) failures.push("toggle notifications do not show both states");
@@ -225,7 +243,12 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 		sessionManager: { getBranch: () => branch, getLeafId: () => "leaf" },
 		isIdle: () => true,
 		hasPendingMessages: () => false,
-		ui: { setStatus: (_k: string, value: string) => statuses.push(value), notify: (value: string) => notices.push(value) },
+		ui: {
+			setStatus: (_k: string, value: string) => statuses.push(value),
+			setWidget: () => {},
+			theme: { bold: (value: string) => value },
+			notify: (value: string) => notices.push(value),
+		},
 	};
 	const pi: any = {
 		on: (name: string, handler: any) => handlers.set(name, handler),
@@ -254,7 +277,7 @@ async function modeCase(): Promise<string[]> {
 
 	const frontier = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	if (frontier.statuses[0] !== "rotation: frontier") failures.push(`frontier model did not select frontier mode: ${frontier.statuses[0]}`);
-	await frontier.commands.get("rotation")?.handler("frontier", frontier.ctx);
+	await frontier.commands.get("mrf")?.handler("", frontier.ctx);
 	if (frontier.at() !== "anthropic/claude-opus-5:medium") failures.push(`frontier did not start on opus at medium: ${frontier.at()}`);
 	frontier.ctx.thinkingLevel = "high"; // a manual bump the ladder must read back
 	await frontier.limit();
@@ -265,7 +288,7 @@ async function modeCase(): Promise<string[]> {
 
 	const casual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
 	if (casual.statuses[0] !== "rotation: casual") failures.push(`casual model did not select casual mode: ${casual.statuses[0]}`);
-	await casual.commands.get("rotation")?.handler("casual", casual.ctx);
+	await casual.commands.get("mrc")?.handler("", casual.ctx);
 	if (casual.at() !== "openai-codex/gpt-5.6-luna:xhigh") failures.push(`casual did not overwrite effort to xhigh: ${casual.at()}`);
 	casual.ctx.thinkingLevel = "high"; // inside casual the level travels untouched
 	await casual.limit();

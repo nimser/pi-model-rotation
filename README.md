@@ -10,8 +10,8 @@ Private global pi package for quota-aware model rotation across the shared host 
 | `casual` | `openai-codex/gpt-5.6-luna` | `opencode-go/gpt-5.6-luna` |
 
 The current model selects the mode at session start and whenever the model
-changes. A model in neither chain disables rotation. Switch with `/rotation
-frontier` or `/rotation casual`; the footer shows the active mode. opencode-go
+changes. A model in neither chain disables rotation. Use `/mrf` for frontier
+mode or `/mrc` for casual mode; the footer shows the active mode. opencode-go
 is the last resort of its mode and is picked only once every other hop is out of
 quota or cooling down from a 429. A 429 on Go while
 the OpenAI plan is also spent drops casual back to frontier — nothing ever
@@ -21,9 +21,9 @@ The extension paces weekly quotas toward their reset before comparing projected
 headroom, while short windows remain capacity guards only. The first 429 is a
 backstop. OpenRouter is never a rotation target.
 
-`/rotation-toggle` disables or re-enables rotation for the current session;
-the footer then shows `rotation: off`. `/rotation` with no argument shows quota
-details and routing counters.
+`/mrt` disables or re-enables rotation for the current session. `/mru` refreshes
+and shows quota details and routing counters; `/mru hide` clears the usage
+widget, and `/mru toggle` shows or hides it without changing quota state.
 
 ## Effort
 
@@ -44,7 +44,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.7.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.0
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
@@ -86,8 +86,8 @@ carries a monthly allowance of $15 or $60, and the rolling five-hour and
 calendar-week windows are 20 % and 50 % of it — but no routing decision depends
 on the answer: Go is the last resort of its mode, entered when everything else
 is spent and left on a 429 or when a plan recovers. A number that changes
-nothing is not worth a weekly parse of somebody else's docs, so `/rotation`
-prints `last resort; no usage API` instead of a figure it cannot check.
+nothing is not worth a weekly parse of somebody else's docs, so `/mru` prints
+`last resort; no usage API` instead of a figure it cannot check.
 
 The one consequence that is handled: Go's shortest window is five rolling hours,
 so its cooldown after a 429 is five hours rather than the fifteen-minute

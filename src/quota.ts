@@ -75,34 +75,55 @@ function tokenHash(token: string): string {
 	return createHash("sha256").update(token).digest("hex");
 }
 
-function activeAnthropicHash(): string | undefined {
-	try {
-		const file = JSON.parse(readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8"));
-		const token = file?.claudeAiOauth?.accessToken;
-		return typeof token === "string" ? tokenHash(token) : undefined;
-	} catch {
-		return undefined;
-	}
+interface ActiveAnthropicCredential {
+	token: string;
+	hash: string;
+	account?: string;
 }
 
 function cswapRoot(): string {
 	return envPath("MODEL_ROTATION_CSWAP_DIR", join(homedir(), ".local", "share", "claude-swap"));
 }
 
+function activeAnthropicCredential(): ActiveAnthropicCredential | undefined {
+	try {
+		const file = JSON.parse(readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8"));
+		const token = file?.claudeAiOauth?.accessToken;
+		if (typeof token !== "string" || !token) return undefined;
+		let account: string | undefined;
+		try {
+			const sequence = JSON.parse(readFileSync(join(cswapRoot(), "sequence.json"), "utf8"));
+			const number = sequence?.activeAccountNumber;
+			if ((typeof number === "number" && Number.isInteger(number) && number > 0) || (typeof number === "string" && /^\d+$/.test(number))) {
+				account = `anthropic-${Number(number)}`;
+			}
+		} catch {
+			// The token hash still identifies the active account when cswap metadata is unavailable.
+		}
+		return { token, hash: tokenHash(token), account };
+	} catch {
+		return undefined;
+	}
+}
+
 function anthropicCredentials(): { account: string; token: string; active: boolean }[] {
 	const directory = join(cswapRoot(), "credentials");
-	const active = activeAnthropicHash();
+	const active = activeAnthropicCredential();
 	const credentials: { account: string; token: string; active: boolean }[] = [];
 	for (const name of readdirSync(directory).sort()) {
 		const match = /^\.creds-(\d+)-.+\.enc$/.exec(name);
 		if (!match) continue;
+		const account = `anthropic-${Number(match[1])}`;
 		try {
 			const decoded = Buffer.from(readFileSync(join(directory, name), "utf8").trim(), "base64").toString("utf8");
 			const file = JSON.parse(decoded);
-			const token = file?.claudeAiOauth?.accessToken;
-			if (typeof token === "string" && token) credentials.push({ account: `anthropic-${match[1]}`, token, active: tokenHash(token) === active });
+			const storedToken = file?.claudeAiOauth?.accessToken;
+			if (typeof storedToken === "string" && storedToken) {
+				const activeAccount = tokenHash(storedToken) === active?.hash || account === active?.account;
+				credentials.push({ account, token: activeAccount && active ? active.token : storedToken, active: activeAccount });
+			}
 		} catch {
-			credentials.push({ account: `anthropic-${match[1]}`, token: "", active: false });
+			credentials.push({ account, token: account === active?.account && active ? active.token : "", active: account === active?.account });
 		}
 	}
 	return credentials;
@@ -241,11 +262,11 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 		} catch {
 			anthropic = [];
 		}
-		const cached = cachedAnthropic(anthropic);
+		const cached = options.refresh ? [] : cachedAnthropic(anthropic);
 		const cachedAccounts = new Set(cached.map((entry) => entry.account));
 		const raw = await Promise.all([
 			...cached,
-			...anthropic.filter((credential) => !cachedAccounts.has(credential.account)).map(pollAnthropic),
+			...anthropic.filter((credential) => options.refresh || !cachedAccounts.has(credential.account)).map(pollAnthropic),
 			pollOpenAI(),
 		]);
 		if (!anthropic.length) raw.unshift({ provider: "anthropic", account: "anthropic-store", reachable: false, reason: "no readable claude-swap accounts" });

@@ -1,7 +1,7 @@
 /**
  * model-rotation — keep an unattended run alive across rate limits.
  *
- * Two modes follow the current model; /rotation can switch them by hand:
+ * Two modes follow the current model; /mrc and /mrf switch them by hand:
  *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-5.6-sol → opencode-go/kimi-k3
  *   casual    openai-codex/gpt-5.6-luna → opencode-go/gpt-5.6-luna
  *
@@ -154,9 +154,39 @@ export default function modelRotation(pi: ExtensionAPI) {
 	let pendingResume: { leaf: string | undefined; to: string } | undefined;
 	let lastRotationAt = 0;
 	const blockedAfter: Record<string, number> = {};
+	let usageVisible = false;
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (ctx.hasUI) ctx.ui.setStatus("model-rotation", `rotation: ${enabled ? mode : "off"}`);
+	}
+
+	function clearUsage(ctx: ExtensionContext): void {
+		usageVisible = false;
+		if (ctx.hasUI) ctx.ui.setWidget("model-rotation", undefined);
+	}
+
+	function usageLines(quotas: Awaited<ReturnType<typeof readQuotas>>, ctx: ExtensionContext): string[] {
+		const lines = quotas.map((entry) => {
+			const active = entry.active ? "→" : " ";
+			const quota = entry.reachable
+				? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
+				: `unknown · ${entry.reason ?? "unavailable"}`;
+			const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
+			return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;
+		});
+		lines.push(`mode: ${mode} · effort: ${ladder} · state: ${enabled ? "on" : "off"} · rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
+		return lines;
+	}
+
+	async function showUsage(ctx: ExtensionContext): Promise<void> {
+		const quotas = await readQuotas({ refresh: true });
+		const lines = usageLines(quotas, ctx);
+		if (ctx.hasUI) {
+			ctx.ui.setWidget("model-rotation", lines);
+			usageVisible = true;
+		} else {
+			console.error(lines.join("\n"));
+		}
 	}
 
 	function restoreState(ctx: ExtensionContext): void {
@@ -320,6 +350,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
+		clearUsage(ctx);
 		restoreState(ctx);
 		updateStatus(ctx);
 	});
@@ -406,7 +437,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.registerCommand("rotation-toggle", {
+	pi.registerCommand("mrt", {
 		description: "Enable or disable model rotation for this session",
 		handler: async (_args, ctx) => {
 			requestedEnabled = !requestedEnabled;
@@ -419,37 +450,50 @@ export default function modelRotation(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("rotation", {
-		description: "Show quota and routing state, or switch mode: /rotation [frontier|casual]",
+	pi.registerCommand("mru", {
+		description: "Refresh and show model rotation usage; use /mru hide to clear it",
 		handler: async (args, ctx) => {
 			const requested = args.trim().toLowerCase();
-			if (requested === "frontier" || requested === "casual") {
-				setMode(requested as Mode, ctx);
-				const now = Date.now();
-				const { normal, lastResort } = hops(now);
-				const target = [...normal, ...lastResort][0];
-				if (target) await switchTo(target, ctx, `${requested} mode`);
+			if (["hide", "minimize", "min", "off"].includes(requested)) {
+				clearUsage(ctx);
 				return;
 			}
-			if (requested) {
-				const message = `unknown mode "${requested}"; use frontier or casual`;
+			if (requested === "toggle" && usageVisible) {
+				clearUsage(ctx);
+				return;
+			}
+			if (requested && !["show", "refresh", "toggle"].includes(requested)) {
+				const message = `unknown usage action "${requested}"; use /mru, /mru hide, or /mru toggle`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
 				else console.error(message);
 				return;
 			}
-			const quotas = await readQuotas();
-			const lines = quotas.map((entry) => {
-				const active = entry.active ? "→" : " ";
-				const quota = entry.reachable
-					? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
-					: `unknown · ${entry.reason}`;
-				const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
-				return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;
-			});
-			lines.push(`mode: ${mode} · effort: ${ladder} · state: ${enabled ? "on" : "off"} · rotations: ${rotations} · resumes: ${resumes}/${config.maxResumesPerSession}`);
-			if (ctx.hasUI) ctx.ui.setWidget("model-rotation", lines);
-			else console.error(lines.join("\n"));
+			try {
+				await showUsage(ctx);
+			} catch (error) {
+				const message = `model rotation usage unavailable: ${(error as Error).message}`;
+				if (ctx.hasUI) ctx.ui.notify(message, "error");
+				else console.error(message);
+			}
 		},
+	});
+
+	async function enterMode(next: Mode, ctx: ExtensionContext): Promise<void> {
+		setMode(next, ctx);
+		const now = Date.now();
+		const { normal, lastResort } = hops(now);
+		const target = [...normal, ...lastResort][0];
+		if (target) await switchTo(target, ctx, `${next} mode`);
+	}
+
+	pi.registerCommand("mrc", {
+		description: "Switch to casual model rotation",
+		handler: async (_args, ctx) => enterMode("casual", ctx),
+	});
+
+	pi.registerCommand("mrf", {
+		description: "Switch to frontier model rotation",
+		handler: async (_args, ctx) => enterMode("frontier", ctx),
 	});
 
 	pi.on("session_shutdown", () => installed.delete(pi as object));
