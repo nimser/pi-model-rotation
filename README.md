@@ -44,7 +44,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.0
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.1
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

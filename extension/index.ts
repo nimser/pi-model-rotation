@@ -169,7 +169,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 		const lines = quotas.map((entry) => {
 			const active = entry.active ? "→" : " ";
 			const quota = entry.reachable
-				? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt} · burn ${entry.burnPercentPerHour ?? 0}%/h`
+				? `${entry.remainingPercent?.toFixed(1)}% left · reset ${entry.resetsAt ?? "unknown"} · burn ${entry.burnPercentPerHour ?? 0}%/h`
 				: `unknown · ${entry.reason ?? "unavailable"}`;
 			const line = `${active} ${entry.provider}/${entry.account} · ${quota}`;
 			return entry.active && ctx.hasUI ? ctx.ui.theme.bold(line) : line;

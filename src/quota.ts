@@ -17,7 +17,12 @@ export interface QuotaEntry {
 	burnPercentPerHour?: number;
 	forecastExhaustsAt?: string;
 	reason?: string;
-	windows?: Record<string, { usedPercent: number; resetsAt: string }>;
+	windows?: Record<string, UsageWindow>;
+}
+
+interface UsageWindow {
+	usedPercent: number;
+	resetsAt?: string;
 }
 
 interface QuotaCache {
@@ -69,6 +74,24 @@ function iso(value: unknown): string {
 	const date = new Date(typeof value === "number" && value < 10_000_000_000 ? value * 1000 : String(value));
 	if (!Number.isFinite(date.getTime())) throw new Error("usage response omitted reset instant");
 	return date.toISOString();
+}
+
+function optionalIso(value: unknown): string | undefined {
+	if (value === undefined || value === null || value === "") return undefined;
+	return iso(value);
+}
+
+function usageWindow(used: unknown, reset: unknown): UsageWindow {
+	const resetsAt = optionalIso(reset);
+	return { usedPercent: percentage(used), ...(resetsAt ? { resetsAt } : {}) };
+}
+
+function limitingWindow(windows: Record<string, UsageWindow>): UsageWindow {
+	return Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0]!;
+}
+
+function summaryReset(windows: Record<string, UsageWindow>): string | undefined {
+	return limitingWindow(windows).resetsAt ?? Object.values(windows).find((window) => window.resetsAt)?.resetsAt;
 }
 
 function tokenHash(token: string): string {
@@ -142,10 +165,10 @@ function cachedAnthropic(credentials: { account: string; token: string; active: 
 			const ownedUntil = Math.max(Number(account?.nextPollAt) * 1000, fetchedAt + CACHE_MS) + 30_000;
 			if (!good || !Number.isFinite(fetchedAt) || now > ownedUntil) return [];
 			const windows = {
-				five_hour: { usedPercent: percentage(good?.five_hour?.pct), resetsAt: iso(good?.five_hour?.resets_at) },
-				seven_day: { usedPercent: percentage(good?.seven_day?.pct), resetsAt: iso(good?.seven_day?.resets_at) },
+				five_hour: usageWindow(good?.five_hour?.pct, good?.five_hour?.resets_at),
+				seven_day: usageWindow(good?.seven_day?.pct, good?.seven_day?.resets_at),
 			};
-			const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
+			const limiting = limitingWindow(windows);
 			return [{
 				provider: "anthropic",
 				account: credential.account,
@@ -153,7 +176,7 @@ function cachedAnthropic(credentials: { account: string; token: string; active: 
 				active: credential.active,
 				usedPercent: limiting.usedPercent,
 				remainingPercent: 100 - limiting.usedPercent,
-				resetsAt: limiting.resetsAt,
+				resetsAt: summaryReset(windows),
 				fetchedAt: new Date(fetchedAt).toISOString(),
 				windows,
 			}];
@@ -171,10 +194,10 @@ async function pollAnthropic(credential: { account: string; token: string; activ
 			"anthropic-beta": "oauth-2025-04-20",
 		});
 		const windows = {
-			five_hour: { usedPercent: percentage(body?.five_hour?.utilization), resetsAt: iso(body?.five_hour?.resets_at) },
-			seven_day: { usedPercent: percentage(body?.seven_day?.utilization), resetsAt: iso(body?.seven_day?.resets_at) },
+			five_hour: usageWindow(body?.five_hour?.utilization, body?.five_hour?.resets_at),
+			seven_day: usageWindow(body?.seven_day?.utilization, body?.seven_day?.resets_at),
 		};
-		const limiting = Object.values(windows).sort((a, b) => b.usedPercent - a.usedPercent)[0];
+		const limiting = limitingWindow(windows);
 		return {
 			provider: "anthropic",
 			account: credential.account,
@@ -182,7 +205,7 @@ async function pollAnthropic(credential: { account: string; token: string; activ
 			active: credential.active,
 			usedPercent: limiting.usedPercent,
 			remainingPercent: 100 - limiting.usedPercent,
-			resetsAt: limiting.resetsAt,
+			resetsAt: summaryReset(windows),
 			fetchedAt: new Date().toISOString(),
 			windows,
 		};
@@ -280,7 +303,7 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 	}
 }
 
-function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt: string } | undefined {
+function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt?: string } | undefined {
 	if (entry.provider === "anthropic") return entry.windows?.seven_day;
 	if (entry.provider === "openai-codex") return entry.windows?.primary;
 	return undefined;
@@ -296,7 +319,7 @@ export function chooseRoute(entries: QuotaEntry[], options: { currentProvider?: 
 		.map((entry) => {
 			const projected = (entry.remainingPercent as number) - (entry.burnPercentPerHour ?? 0) * hours * 1.2;
 			const weekly = weeklyWindow(entry);
-			const hoursToWeeklyReset = weekly ? (Date.parse(weekly.resetsAt) - now) / 3_600_000 : 0;
+			const hoursToWeeklyReset = weekly?.resetsAt ? (Date.parse(weekly.resetsAt) - now) / 3_600_000 : 0;
 			const weeklyPressure = weekly && hoursToWeeklyReset > 0 ? (100 - weekly.usedPercent) / hoursToWeeklyReset : 0;
 			return { entry, projected, weeklyPressure };
 		})

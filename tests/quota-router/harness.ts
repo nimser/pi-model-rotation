@@ -50,7 +50,8 @@ async function cacheCase(): Promise<string[]> {
 		if (request.url === "/anthropic") {
 			const authorization = request.headers.authorization ?? "";
 			const used = authorization.includes("anthropic-refreshed") ? 5 : authorization.includes("anthropic-one") ? 80 : 20;
-			response.end(JSON.stringify({ five_hour: { utilization: used, resets_at: reset }, seven_day: { utilization: 10, resets_at: reset } }));
+			const fiveHour = authorization.includes("anthropic-two") ? { utilization: used } : { utilization: used, resets_at: reset };
+			response.end(JSON.stringify({ five_hour: fiveHour, seven_day: { utilization: 10, resets_at: reset } }));
 			return;
 		}
 		if (request.url === "/openai") {
@@ -81,6 +82,8 @@ async function cacheCase(): Promise<string[]> {
 		if (entries.length !== 4) failures.push(`expected four subscriptions, got ${entries.length}`);
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
+		const account2 = entries.find((entry) => entry.account === "anthropic-2");
+		if (!account2?.reachable || account2.windows?.five_hour.resetsAt !== undefined || account2.resetsAt !== reset) failures.push(`missing per-window reset made account 2 unknown: ${JSON.stringify(account2)}`);
 		const go = entries.find((entry) => entry.provider === "opencode-go");
 		if (go?.reachable || !go?.reason) failures.push(`go should report as a last resort with no usage API: ${JSON.stringify(go)}`);
 		const afterFirst = requests;
@@ -91,13 +94,16 @@ async function cacheCase(): Promise<string[]> {
 		mkdirSync(usageDir, { recursive: true });
 		const epoch = Date.now() / 1000;
 		const lastGood = { five_hour: { pct: 40, resets_at: reset }, seven_day: { pct: 10, resets_at: reset } };
-		writeFileSync(join(usageDir, "usage.json"), JSON.stringify({ accounts: { 1: { lastGood, fetchedAt: epoch, nextPollAt: epoch + 600 }, 2: { lastGood, fetchedAt: epoch, nextPollAt: epoch + 600 } } }));
+		const account2LastGood = { five_hour: { pct: 0 }, seven_day: { pct: 10, resets_at: reset } };
+		writeFileSync(join(usageDir, "usage.json"), JSON.stringify({ accounts: { 1: { lastGood, fetchedAt: epoch, nextPollAt: epoch + 600 }, 2: { lastGood: account2LastGood, fetchedAt: epoch, nextPollAt: epoch + 600 } } }));
 		rmSync(join(root, "quota.json"), { force: true });
 		const cacheOwnedEnv = { ...env };
 		delete cacheOwnedEnv.MODEL_ROTATION_IGNORE_CSWAP_USAGE;
 		const beforeOwned = requests;
 		const cacheOwned = await runQuota(cacheOwnedEnv);
-		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1) failures.push(`cswap-owned cadence was duplicated (${requests - beforeOwned} network requests)`);
+		const cachedEntries = JSON.parse(cacheOwned.stdout) as QuotaEntry[];
+		const cachedAccount2 = cachedEntries.find((entry) => entry.account === "anthropic-2");
+		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1 || !cachedAccount2?.reachable || cachedAccount2.resetsAt !== reset) failures.push(`cswap cache did not tolerate missing reset: ${requests - beforeOwned} requests, ${JSON.stringify(cachedAccount2)}`);
 
 		writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-refreshed"));
 		const beforeRefresh = requests;
