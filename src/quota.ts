@@ -66,8 +66,14 @@ function writeCache(cache: QuotaCache): void {
 
 function percentage(value: unknown): number {
 	const number = Number(value);
+	if (!Number.isFinite(number)) throw new Error("usage response omitted percentage");
+	return Math.max(0, Math.min(100, number));
+}
+
+function utilizationPercentage(value: unknown): number {
+	const number = Number(value);
 	if (!Number.isFinite(number)) throw new Error("usage response omitted utilization");
-	return Math.max(0, Math.min(100, number <= 1 ? number * 100 : number));
+	return percentage(number <= 1 ? number * 100 : number);
 }
 
 function iso(value: unknown): string {
@@ -84,6 +90,11 @@ function optionalIso(value: unknown): string | undefined {
 function usageWindow(used: unknown, reset: unknown): UsageWindow {
 	const resetsAt = optionalIso(reset);
 	return { usedPercent: percentage(used), ...(resetsAt ? { resetsAt } : {}) };
+}
+
+function utilizationWindow(used: unknown, reset: unknown): UsageWindow {
+	const resetsAt = optionalIso(reset);
+	return { usedPercent: utilizationPercentage(used), ...(resetsAt ? { resetsAt } : {}) };
 }
 
 function limitingWindow(windows: Record<string, UsageWindow>): UsageWindow {
@@ -194,8 +205,8 @@ async function pollAnthropic(credential: { account: string; token: string; activ
 			"anthropic-beta": "oauth-2025-04-20",
 		});
 		const windows = {
-			five_hour: usageWindow(body?.five_hour?.utilization, body?.five_hour?.resets_at),
-			seven_day: usageWindow(body?.seven_day?.utilization, body?.seven_day?.resets_at),
+			five_hour: utilizationWindow(body?.five_hour?.utilization, body?.five_hour?.resets_at),
+			seven_day: utilizationWindow(body?.seven_day?.utilization, body?.seven_day?.resets_at),
 		};
 		const limiting = limitingWindow(windows);
 		return {
@@ -309,12 +320,27 @@ function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt?: stri
 	return undefined;
 }
 
+export function immediateCapacity(entry: QuotaEntry, now = Date.now()): boolean | undefined {
+	if (!entry.reachable || entry.active === false || entry.remainingPercent === undefined || !entry.fetchedAt) return undefined;
+	if (Date.parse(entry.resetsAt ?? "") <= now) return undefined;
+	return entry.remainingPercent > 0;
+}
+
+export function providerCapacity(entries: QuotaEntry[], provider: string, blockedAt = 0, now = Date.now()): boolean | undefined {
+	const observed = entries
+		.filter((entry) => entry.provider === provider && entry.active !== false)
+		.filter((entry) => Date.parse(entry.fetchedAt ?? "") > blockedAt)
+		.map((entry) => immediateCapacity(entry, now));
+	if (observed.includes(true)) return true;
+	if (observed.length && observed.every((capacity) => capacity === false)) return false;
+	return undefined;
+}
+
 export function chooseRoute(entries: QuotaEntry[], options: { currentProvider?: string; taskMinutes?: number; blockedAfter?: Record<string, number> } = {}): RouteChoice | undefined {
 	const hours = Math.max(0, options.taskMinutes ?? 60) / 60;
 	const now = Date.now();
 	const candidates = entries
-		.filter((entry) => entry.reachable && entry.active !== false && entry.remainingPercent !== undefined && entry.fetchedAt)
-		.filter((entry) => Date.parse(entry.resetsAt ?? "") > now)
+		.filter((entry) => immediateCapacity(entry, now) === true)
 		.filter((entry) => Date.parse(entry.fetchedAt as string) > (options.blockedAfter?.[entry.provider] ?? 0))
 		.map((entry) => {
 			const projected = (entry.remainingPercent as number) - (entry.burnPercentPerHour ?? 0) * hours * 1.2;
@@ -322,8 +348,7 @@ export function chooseRoute(entries: QuotaEntry[], options: { currentProvider?: 
 			const hoursToWeeklyReset = weekly?.resetsAt ? (Date.parse(weekly.resetsAt) - now) / 3_600_000 : 0;
 			const weeklyPressure = weekly && hoursToWeeklyReset > 0 ? (100 - weekly.usedPercent) / hoursToWeeklyReset : 0;
 			return { entry, projected, weeklyPressure };
-		})
-		.filter(({ projected, weeklyPressure }) => projected > 0 || weeklyPressure > 0);
+		});
 	if (!candidates.length) return undefined;
 
 	const maxWeeklyPressure = Math.max(...candidates.map(({ weeklyPressure }) => weeklyPressure));

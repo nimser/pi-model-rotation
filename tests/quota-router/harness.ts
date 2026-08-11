@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import modelRotation from "../../extension/index.ts";
-import { chooseRoute, type QuotaEntry } from "../../src/quota.ts";
+import { chooseRoute, providerCapacity, type QuotaEntry } from "../../src/quota.ts";
 
 const REPO = join(import.meta.dirname, "..", "..");
 const requested = process.argv.slice(2).map((arg) => arg.replace(/^--/, ""));
@@ -49,13 +49,13 @@ async function cacheCase(): Promise<string[]> {
 		response.setHeader("content-type", "application/json");
 		if (request.url === "/anthropic") {
 			const authorization = request.headers.authorization ?? "";
-			const used = authorization.includes("anthropic-refreshed") ? 5 : authorization.includes("anthropic-one") ? 80 : 20;
+			const used = authorization.includes("anthropic-refreshed") ? 0.05 : authorization.includes("anthropic-one") ? 0.8 : 0.2;
 			const fiveHour = authorization.includes("anthropic-two") ? { utilization: used } : { utilization: used, resets_at: reset };
-			response.end(JSON.stringify({ five_hour: fiveHour, seven_day: { utilization: 10, resets_at: reset } }));
+			response.end(JSON.stringify({ five_hour: fiveHour, seven_day: { utilization: 0.1, resets_at: reset } }));
 			return;
 		}
 		if (request.url === "/openai") {
-			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 30, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
+			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
 			return;
 		}
 
@@ -82,8 +82,12 @@ async function cacheCase(): Promise<string[]> {
 		if (entries.length !== 4) failures.push(`expected four subscriptions, got ${entries.length}`);
 		if (!entries.filter((entry) => entry.reachable).every((entry) => typeof entry.usedPercent === "number" && typeof entry.resetsAt === "string")) failures.push("reachable entries lack percent/reset");
 		if (!entries.some((entry) => entry.account === "anthropic-1" && entry.active) || entries.some((entry) => entry.account === "anthropic-2" && entry.active)) failures.push("active Anthropic account was not identified safely");
+		const account1 = entries.find((entry) => entry.account === "anthropic-1");
 		const account2 = entries.find((entry) => entry.account === "anthropic-2");
+		const openai = entries.find((entry) => entry.provider === "openai-codex");
+		if (account1?.usedPercent !== 80 || account2?.usedPercent !== 20) failures.push(`Anthropic utilization was not parsed as a ratio: ${JSON.stringify([account1, account2])}`);
 		if (!account2?.reachable || account2.windows?.five_hour.resetsAt !== undefined || account2.resetsAt !== reset) failures.push(`missing per-window reset made account 2 unknown: ${JSON.stringify(account2)}`);
+		if (openai?.usedPercent !== 1 || openai.remainingPercent !== 99) failures.push(`OpenAI's 1% was not parsed as one percent: ${JSON.stringify(openai)}`);
 		const go = entries.find((entry) => entry.provider === "opencode-go");
 		if (go?.reachable || !go?.reason) failures.push(`go should report as a last resort with no usage API: ${JSON.stringify(go)}`);
 		const afterFirst = requests;
@@ -94,7 +98,7 @@ async function cacheCase(): Promise<string[]> {
 		mkdirSync(usageDir, { recursive: true });
 		const epoch = Date.now() / 1000;
 		const lastGood = { five_hour: { pct: 40, resets_at: reset }, seven_day: { pct: 10, resets_at: reset } };
-		const account2LastGood = { five_hour: { pct: 0 }, seven_day: { pct: 10, resets_at: reset } };
+		const account2LastGood = { five_hour: { pct: 1 }, seven_day: { pct: 10, resets_at: reset } };
 		writeFileSync(join(usageDir, "usage.json"), JSON.stringify({ accounts: { 1: { lastGood, fetchedAt: epoch, nextPollAt: epoch + 600 }, 2: { lastGood: account2LastGood, fetchedAt: epoch, nextPollAt: epoch + 600 } } }));
 		rmSync(join(root, "quota.json"), { force: true });
 		const cacheOwnedEnv = { ...env };
@@ -103,7 +107,7 @@ async function cacheCase(): Promise<string[]> {
 		const cacheOwned = await runQuota(cacheOwnedEnv);
 		const cachedEntries = JSON.parse(cacheOwned.stdout) as QuotaEntry[];
 		const cachedAccount2 = cachedEntries.find((entry) => entry.account === "anthropic-2");
-		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1 || !cachedAccount2?.reachable || cachedAccount2.resetsAt !== reset) failures.push(`cswap cache did not tolerate missing reset: ${requests - beforeOwned} requests, ${JSON.stringify(cachedAccount2)}`);
+		if (cacheOwned.status !== 0 || requests - beforeOwned !== 1 || !cachedAccount2?.reachable || cachedAccount2.usedPercent !== 10 || cachedAccount2.windows?.five_hour.usedPercent !== 1 || cachedAccount2.resetsAt !== reset) failures.push(`cswap cache did not preserve percentage units or tolerate missing reset: ${requests - beforeOwned} requests, ${JSON.stringify(cachedAccount2)}`);
 
 		writeFileSync(join(home, ".claude", ".credentials.json"), oauth("anthropic-refreshed"));
 		const beforeRefresh = requests;
@@ -149,6 +153,18 @@ async function routingCase(): Promise<string[]> {
 	const inactive = chooseRoute([entry("anthropic", "a2", 99, { active: false }), entry("openai-codex", "o1", 40)]);
 	if (inactive?.provider !== "openai-codex") failures.push("router selected an account it cannot activate");
 
+	const exhaustedShortWindow = entry("anthropic", "a1", 0, { burnPercentPerHour: 110, windows: {
+		five_hour: { usedPercent: 100, resetsAt },
+		seven_day: { usedPercent: 41, resetsAt: new Date(now + 36 * 3_600_000).toISOString() },
+	} });
+	const openaiHeadroom = entry("openai-codex", "o1", 98, { windows: {
+		primary: { usedPercent: 2, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+	} });
+	const capacityGuard = chooseRoute([exhaustedShortWindow, openaiHeadroom], { currentProvider: "openai-codex" });
+	if (capacityGuard?.provider !== "openai-codex") failures.push(`weekly pressure bypassed exhausted immediate capacity: ${JSON.stringify(capacityGuard)}`);
+	if (providerCapacity([exhaustedShortWindow], "anthropic") !== false) failures.push("an exhausted current window was not proven spent");
+	if (chooseRoute([exhaustedShortWindow]) !== undefined) failures.push("an exhausted provider remained routable without another hop");
+
 	const expiry = chooseRoute([
 		entry("anthropic", "a1", 9, { burnPercentPerHour: 20, windows: {
 			five_hour: { usedPercent: 20, resetsAt: new Date(now + 4 * 3_600_000).toISOString() },
@@ -182,6 +198,7 @@ async function routingCase(): Promise<string[]> {
 	if (registrations !== once) failures.push("loading model-rotation twice registered duplicate handlers");
 	const source = readFileSync(join(REPO, "extension", "index.ts"), "utf8");
 	if (source.includes("sendUserMessage") || source.includes("cooldown expired")) failures.push("fake-user resume or time-only switchback remains in model-rotation");
+	if (source.includes('pi.on("turn_start"') || !source.includes('pi.on("before_agent_start"')) failures.push("quota routing still changes the model after the agent run starts");
 
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
@@ -233,6 +250,42 @@ async function routingCase(): Promise<string[]> {
 	return failures;
 }
 
+function testQuota(provider: string, remainingPercent: number, extra: Partial<QuotaEntry> = {}): QuotaEntry {
+	const resetsAt = new Date(Date.now() + 6 * 3_600_000).toISOString();
+	return {
+		provider,
+		account: `${provider}-test`,
+		reachable: true,
+		active: true,
+		usedPercent: 100 - remainingPercent,
+		remainingPercent,
+		resetsAt,
+		fetchedAt: new Date().toISOString(),
+		burnPercentPerHour: 0,
+		windows: provider === "anthropic"
+			? { five_hour: { usedPercent: 100 - remainingPercent, resetsAt }, seven_day: { usedPercent: 20, resetsAt: new Date(Date.now() + 6 * 24 * 3_600_000).toISOString() } }
+			: { primary: { usedPercent: 100 - remainingPercent, resetsAt } },
+		...extra,
+	};
+}
+
+function testQuotaCache() {
+	const root = mkdtempSync(join(tmpdir(), "model-rotation-modes-"));
+	const path = join(root, "quota.json");
+	const previous = process.env.MODEL_ROTATION_QUOTA_CACHE;
+	process.env.MODEL_ROTATION_QUOTA_CACHE = path;
+	return {
+		write(entries: QuotaEntry[]) {
+			writeFileSync(path, JSON.stringify({ version: 1, fetchedAt: new Date().toISOString(), entries }));
+		},
+		close() {
+			if (previous === undefined) delete process.env.MODEL_ROTATION_QUOTA_CACHE;
+			else process.env.MODEL_ROTATION_QUOTA_CACHE = previous;
+			rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
+
 /** A fake session that records what rotation does to the model and its effort. */
 function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5" }, branch: unknown[] = []) {
 	const handlers = new Map<string, (...args: any[]) => any>();
@@ -272,7 +325,6 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 	handlers.get("session_start")?.({}, ctx);
 	const at = () => `${ctx.model?.provider}/${ctx.model?.id}:${ctx.thinkingLevel}`;
 	const limit = async () => {
-		await new Promise((resolve) => setTimeout(resolve, 2100)); // the rotate debounce coalesces one 429
 		await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
 	};
 	return { ctx, commands, handlers, statuses, notices, at, limit, setModelCalls: () => setModelCalls };
@@ -280,6 +332,8 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 
 async function modeCase(): Promise<string[]> {
 	const failures: string[] = [];
+	const cache = testQuotaCache();
+	cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 80)]);
 
 	const frontier = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	if (frontier.statuses[0] !== "rotation: frontier") failures.push(`frontier model did not select frontier mode: ${frontier.statuses[0]}`);
@@ -314,6 +368,21 @@ async function modeCase(): Promise<string[]> {
 	await unsupported.handlers.get("after_provider_response")?.({ status: 429, headers: {} }, unsupported.ctx);
 	if (unsupported.setModelCalls() !== 0) failures.push("unsupported model still rotated after a 429");
 
+	cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 98)]);
+	const proactive = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	await proactive.handlers.get("before_agent_start")?.({}, proactive.ctx);
+	if (proactive.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`pre-agent quota routing did not avoid exhausted Anthropic: ${proactive.at()}`);
+
+	cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 0)]);
+	const directLastResort = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	await directLastResort.limit();
+	if (directLastResort.at() !== "opencode-go/kimi-k3:max") failures.push(`proven exhaustion did not select Go directly: ${directLastResort.at()}`);
+
+	cache.write([testQuota("anthropic", 80), { provider: "openai-codex", account: "openai-test", reachable: false, active: true, reason: "unavailable" }]);
+	const unknownNormal = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	await unknownNormal.limit();
+	if (unknownNormal.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
+
 	const changing = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	const casualModel = { provider: "openai-codex", id: "gpt-5.6-luna" };
 	changing.ctx.model = casualModel;
@@ -323,6 +392,7 @@ async function modeCase(): Promise<string[]> {
 	changing.ctx.model = unsupportedModel;
 	await changing.handlers.get("model_select")?.({ model: unsupportedModel }, changing.ctx);
 	if (changing.statuses.at(-1) !== "rotation: off") failures.push(`model selection did not disable unsupported rotation: ${changing.statuses.at(-1)}`);
+	cache.close();
 	return failures;
 }
 

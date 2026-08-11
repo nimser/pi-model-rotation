@@ -18,8 +18,14 @@ the OpenAI plan is also spent drops casual back to frontier — nothing ever
 promotes frontier to casual.
 
 The extension paces weekly quotas toward their reset before comparing projected
-headroom, while short windows remain capacity guards only. The first 429 is a
-backstop. OpenRouter is never a rotation target.
+headroom. A provider must have positive immediate-window capacity before weekly
+pressure can select it. The first 429 is a backstop, and Go is selected only when
+every normal hop is cooling down from a 429 or has a fresh zero-capacity sample.
+OpenRouter is never a rotation target.
+
+Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
+OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means
+1% used, not 100% used.
 
 `/mrt` disables or re-enables rotation for the current session. `/mru` refreshes
 and shows quota details and routing counters; `/mru hide` clears the usage
@@ -44,7 +50,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.1
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.2
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

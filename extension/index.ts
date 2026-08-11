@@ -42,7 +42,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { chooseRoute, readQuotas } from "../src/quota.ts";
+import { chooseRoute, providerCapacity, readQuotas, type QuotaEntry } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type Mode = "frontier" | "casual";
@@ -152,7 +152,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	let resumes = 0;
 	/** Bound to the exact post-rotation leaf so a later successful turn cancels it. */
 	let pendingResume: { leaf: string | undefined; to: string } | undefined;
-	let lastRotationAt = 0;
+	const lastLimitedAt = new Map<string, number>();
 	const blockedAfter: Record<string, number> = {};
 	let usageVisible = false;
 
@@ -287,7 +287,6 @@ export default function modelRotation(pi: ExtensionAPI) {
 		}
 		const thinking = thinkingFor(entry);
 		pi.setThinkingLevel(thinking);
-		lastRotationAt = Date.now();
 		pi.appendEntry("model-rotation", {
 			to: key(entry.provider, entry.model),
 			thinking,
@@ -314,36 +313,81 @@ export default function modelRotation(pi: ExtensionAPI) {
 		return { normal: usable.filter((entry) => !entry.lastResort), lastResort: usable.filter((entry) => entry.lastResort) };
 	}
 
-	/** Mark the active model as limited and move to the next usable hop. */
-	async function rotate(ctx: ExtensionContext, reason: string, retryAfterSeconds?: number): Promise<boolean> {
+	function taskOptions(ctx: ExtensionContext) {
+		return {
+			currentProvider: ctx.model?.provider,
+			taskMinutes: Number(process.env.MODEL_ROTATION_TASK_MINUTES ?? process.env.METAGROWTH_BUDGET_MINUTES ?? 60),
+			blockedAfter,
+		};
+	}
+
+	function targetFromQuotas(
+		quotas: QuotaEntry[],
+		ctx: ExtensionContext,
+		now: number,
+		skip?: ChainEntry,
+		allowUnknown = false,
+	): { entry: ChainEntry; reason: string } | undefined {
+		const { normal, lastResort } = hops(now, skip);
+		const normalProviders = new Set(normal.map((entry) => entry.provider));
+		const choice = chooseRoute(quotas.filter((entry) => normalProviders.has(entry.provider)), taskOptions(ctx));
+		const target = choice && normal.find((entry) => entry.provider === choice.provider);
+		if (target && choice) return { entry: target, reason: choice.reason };
+
+		if (allowUnknown) {
+			const unknown = normal.find((entry) => providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === undefined);
+			if (unknown) return { entry: unknown, reason: "rate limited" };
+		}
+
+		const spent = chain
+			.filter((entry) => !entry.lastResort)
+			.every((entry) => !available(entry, now) || providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === false);
+		if (spent && lastResort[0]) return { entry: lastResort[0], reason: "last resort" };
+		return undefined;
+	}
+
+	async function quotaTarget(ctx: ExtensionContext, now: number, skip?: ChainEntry, allowUnknown = false) {
+		try {
+			return targetFromQuotas(await readQuotas(), ctx, now, skip, allowUnknown);
+		} catch (error) {
+			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
+			return allowUnknown ? targetFromQuotas([], ctx, now, skip, true) : undefined;
+		}
+	}
+
+	/** Mark the failed model as limited and move to a quota-eligible hop. */
+	async function rotate(
+		ctx: ExtensionContext,
+		reason: string,
+		retryAfterSeconds?: number,
+		failedModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+	): Promise<boolean> {
 		const now = Date.now();
-		// Debounce: several handlers can observe the same 429.
-		if (now - lastRotationAt < 2000) return false;
+		const failedKey = failedModel && key(failedModel.provider, failedModel.id);
+		if (failedKey && now - (lastLimitedAt.get(failedKey) ?? 0) < 2000) return false;
+		if (failedKey) lastLimitedAt.set(failedKey, now);
 		syncLadder(ctx);
 
-		const current = ctx.model;
-		const currentEntry = chain[indexOfCurrent(ctx)];
-		if (current) {
-			block(current.provider, current.id, now + cooldownFor(current.provider, retryAfterSeconds));
-			blockedAfter[current.provider] = now;
+		const failedEntry = failedModel && chain.find((entry) => entry.provider === failedModel.provider && entry.model === failedModel.id);
+		if (failedModel) {
+			block(failedModel.provider, failedModel.id, now + cooldownFor(failedModel.provider, retryAfterSeconds));
+			blockedAfter[failedModel.provider] = now;
 		}
 
 		// Casual is a loan: spending its last resort while OpenAI is also out returns the session to frontier.
-		if (mode === "casual" && currentEntry?.lastResort && !hops(now).normal.length) {
+		if (mode === "casual" && failedEntry?.lastResort && !hops(now).normal.length) {
 			setMode("frontier", ctx);
 			console.error("[model-rotation] casual exhausted → frontier");
 			if (ctx.hasUI) ctx.ui.notify("model-rotation: casual exhausted → frontier", "warning");
 		}
 
-		const { normal, lastResort } = hops(now, currentEntry);
-		for (const entry of [...normal, ...lastResort]) {
-			if (await switchTo(entry, ctx, reason)) {
-				rotations += 1;
-				pendingResume = config.autoResume ? { leaf: ctx.sessionManager.getLeafId(), to: key(entry.provider, entry.model) } : undefined;
-				return true;
-			}
+		const target = await quotaTarget(ctx, now, failedEntry, true);
+		if (target && await switchTo(target.entry, ctx, target.reason === "last resort" ? target.reason : reason)) {
+			rotations += 1;
+			pendingResume = config.autoResume ? { leaf: ctx.sessionManager.getLeafId(), to: key(target.entry.provider, target.entry.model) } : undefined;
+			return true;
 		}
-		console.error("[model-rotation] every hop in the chain is cooling down or unusable");
+		console.error("[model-rotation] every hop in the chain is cooling down, spent, or unusable");
 		if (ctx.hasUI) ctx.ui.notify("model-rotation: no usable model left in the chain", "error");
 		return false;
 	}
@@ -363,15 +407,17 @@ export default function modelRotation(pi: ExtensionAPI) {
 	pi.on("after_provider_response", async (event, ctx) => {
 		if (!enabled || !config.rotateOnStatus.includes(event.status)) return;
 		const retryAfter = Number(event.headers?.["retry-after"] ?? event.headers?.["Retry-After"]);
-		await rotate(ctx, "rate limited", Number.isFinite(retryAfter) ? retryAfter : undefined);
+		const failed = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+		await rotate(ctx, "rate limited", Number.isFinite(retryAfter) ? retryAfter : undefined, failed);
 	});
 
 	// Layer 2: the error surfaced as a finished assistant message.
 	pi.on("message_end", async (event, ctx) => {
-		const message = event.message as { role: string; stopReason?: string; errorMessage?: string };
+		const message = event.message as { role: string; provider?: string; model?: string; stopReason?: string; errorMessage?: string };
 		if (!enabled || message.role !== "assistant" || message.stopReason !== "error") return;
 		if (!RATE_LIMIT_RE.test(message.errorMessage ?? "")) return;
-		await rotate(ctx, "rate limited");
+		const failed = message.provider && message.model ? { provider: message.provider, id: message.model } : undefined;
+		await rotate(ctx, "rate limited", undefined, failed);
 	});
 
 	// Layer 3: the run stopped; resume it on the new model.
@@ -405,36 +451,12 @@ export default function modelRotation(pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("turn_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (_event, ctx) => {
 		if (!enabled || indexOfCurrent(ctx) < 0) return;
-		try {
-			const quotas = await readQuotas();
-			const now = Date.now();
-			const { normal, lastResort } = hops(now);
-			const options = {
-				currentProvider: ctx.model?.provider,
-				taskMinutes: Number(process.env.MODEL_ROTATION_TASK_MINUTES ?? process.env.METAGROWTH_BUDGET_MINUTES ?? 60),
-				blockedAfter,
-			};
-			const normalProviders = new Set(normal.map((entry) => entry.provider));
-			let choice = chooseRoute(quotas.filter((entry) => normalProviders.has(entry.provider)), options);
-			let target = choice && normal.find((entry) => entry.provider === choice?.provider);
-			// The last resort waits for proof, not for silence: every other hop must answer and be spent.
-			if (!target && lastResort.length) {
-				const spent = chain
-					.filter((entry) => !entry.lastResort)
-					.every((entry) => !available(entry, now) || quotas.some((quota) => quota.provider === entry.provider && quota.reachable));
-				if (spent) {
-					target = lastResort[0];
-					choice = { provider: target.provider, account: "", projectedRemainingPercent: 0, reason: "last resort" };
-				}
-			}
-			if (!target || !choice || (target.provider === ctx.model?.provider && target.model === ctx.model?.id)) return;
-			syncLadder(ctx);
-			await switchTo(target, ctx, choice.reason);
-		} catch (error) {
-			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
-		}
+		const target = await quotaTarget(ctx, Date.now());
+		if (!target || (target.entry.provider === ctx.model?.provider && target.entry.model === ctx.model?.id)) return;
+		syncLadder(ctx);
+		await switchTo(target.entry, ctx, target.reason);
 	});
 
 	pi.registerCommand("mrt", {
