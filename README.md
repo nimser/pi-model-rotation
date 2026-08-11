@@ -50,7 +50,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.2
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.3
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
@@ -105,6 +105,9 @@ default, and a `Retry-After` is believed up to a day.
 pi -ne -e ./extension/index.ts
 npm test
 ```
+
+Provider tests use a temporary `PI_CODING_AGENT_DIR`; fake model changes never
+rewrite the operator's global settings.
 
 ## Contributing
 

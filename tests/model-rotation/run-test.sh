@@ -56,7 +56,7 @@ JSON
 	cmd+=("Reply with the single word ROTATION_OK.")
 
 	set +e
-	(cd "$workdir" && timeout 180 "${cmd[@]}" >"$out" 2>&1)
+	(cd "$workdir" && PI_CODING_AGENT_DIR="$workdir/agent" PI_OFFLINE=1 timeout 180 "${cmd[@]}" >"$out" 2>&1)
 	local status=$?
 	set -e
 
@@ -75,6 +75,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider("anthropic", {
 		baseUrl: `http://127.0.0.1:${process.env.FAKE_PROVIDER_PORT ?? 8899}/limited`,
+		apiKey: "test-key",
+		api: "anthropic-messages",
+		models: [{
+			id: "claude-haiku-4-5",
+			name: "claude-haiku-4-5",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		}],
 	});
 }
 TS

@@ -7,7 +7,9 @@ import { join } from "node:path";
 const REPO = join(import.meta.dirname, "..", "..");
 const root = mkdtempSync(join(tmpdir(), "model-rotation-preflight-"));
 const workdir = join(root, "work");
+const agentDir = join(root, "agent");
 mkdirSync(join(workdir, ".pi"), { recursive: true });
+mkdirSync(agentDir, { recursive: true });
 
 const stats = { limited: 0, healthy: 0 };
 const server = createServer((request, response) => {
@@ -83,7 +85,11 @@ function runPi(): Promise<{ code: number; output: string }> {
 			"-p", "-ne", "--provider", "fake-limited", "--model", "always-429", "--no-tools", "--no-session",
 			"-e", join(REPO, "extension", "index.ts"), "-e", join(workdir, "providers.ts"),
 			"Reply with the single word PREFLIGHT_OK.",
-		], { cwd: workdir, env: { ...process.env, MODEL_ROTATION_QUOTA_CACHE: quotaPath }, stdio: ["ignore", "pipe", "pipe"] });
+		], {
+			cwd: workdir,
+			env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", MODEL_ROTATION_QUOTA_CACHE: quotaPath },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		let output = "";
 		child.stdout.on("data", (chunk) => (output += String(chunk)));
 		child.stderr.on("data", (chunk) => (output += String(chunk)));
