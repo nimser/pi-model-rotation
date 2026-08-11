@@ -11,7 +11,10 @@ Private global pi package for quota-aware model rotation across the shared host 
 
 The current model selects the mode at session start and whenever the model
 changes. A model in neither chain disables rotation. Use `/mrf` for frontier
-mode or `/mrc` for casual mode; the footer shows the active mode. opencode-go
+mode or `/mrc` for casual mode; the footer shows the active mode. Asking for a
+mode also turns rotation on, because a disabled router has no mode to be in. The
+command starts at the head of its chain and the quota router moves it before the
+next request is sent. opencode-go
 is the last resort of its mode and is picked only once every other hop is out of
 quota or cooling down from a 429. A 429 on Go while
 the OpenAI plan is also spent drops casual back to frontier — nothing ever
@@ -27,7 +30,8 @@ Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
 OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means
 1% used, not 100% used.
 
-`/mrt` disables or re-enables rotation for the current session. `/mru` refreshes
+`/mrt` disables or re-enables rotation for the current session; `/mrf` and
+`/mrc` re-enable it as well. `/mru` refreshes
 and shows quota details and routing counters; `/mru hide` clears the usage
 widget, and `/mru toggle` shows or hides it without changing quota state.
 
@@ -50,7 +54,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.3
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.4
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

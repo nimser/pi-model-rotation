@@ -292,6 +292,7 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
 	const statuses: string[] = [];
 	const notices: string[] = [];
+	const appended: Array<{ type: string; data: any }> = [];
 	let setModelCalls = 0;
 	const ctx: any = {
 		cwd: join(REPO, "tests"),
@@ -312,7 +313,7 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 	const pi: any = {
 		on: (name: string, handler: any) => handlers.set(name, handler),
 		registerCommand: (name: string, command: any) => commands.set(name, command),
-		appendEntry: () => {},
+		appendEntry: (type: string, data: any) => appended.push({ type, data }),
 		setModel: async (model: any) => {
 			setModelCalls++;
 			ctx.model = model;
@@ -327,7 +328,8 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 	const limit = async () => {
 		await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
 	};
-	return { ctx, commands, handlers, statuses, notices, at, limit, setModelCalls: () => setModelCalls };
+	const persistedState = () => [...appended].reverse().find((entry) => entry.type === "model-rotation-state")?.data;
+	return { ctx, commands, handlers, statuses, notices, at, limit, persistedState, setModelCalls: () => setModelCalls };
 }
 
 async function modeCase(): Promise<string[]> {
@@ -367,6 +369,21 @@ async function modeCase(): Promise<string[]> {
 	if (unsupported.statuses[0] !== "rotation: off") failures.push(`unsupported model did not disable rotation: ${unsupported.statuses[0]}`);
 	await unsupported.handlers.get("after_provider_response")?.({ status: 429, headers: {} }, unsupported.ctx);
 	if (unsupported.setModelCalls() !== 0) failures.push("unsupported model still rotated after a 429");
+
+	// A mode is a rotation policy: asking for one while rotation is off must turn it back on.
+	const reenabled = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
+	await reenabled.commands.get("mrt")?.handler("", reenabled.ctx);
+	if (reenabled.statuses.at(-1) !== "rotation: off") failures.push(`toggle did not disable rotation: ${reenabled.statuses.at(-1)}`);
+	await reenabled.commands.get("mrf")?.handler("", reenabled.ctx);
+	if (reenabled.statuses.at(-1) !== "rotation: frontier") failures.push(`a mode command left the footer disabled: ${reenabled.statuses.at(-1)}`);
+	if (reenabled.persistedState()?.enabled !== true) failures.push(`a mode command persisted rotation as disabled: ${JSON.stringify(reenabled.persistedState())}`);
+	await reenabled.limit();
+	if (reenabled.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
+
+	const reenabledCasual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
+	await reenabledCasual.commands.get("mrt")?.handler("", reenabledCasual.ctx);
+	await reenabledCasual.commands.get("mrc")?.handler("", reenabledCasual.ctx);
+	if (reenabledCasual.statuses.at(-1) !== "rotation: casual" || reenabledCasual.persistedState()?.enabled !== true) failures.push(`casual mode did not re-enable rotation: ${reenabledCasual.statuses.at(-1)}`);
 
 	cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 98)]);
 	const proactive = fakeSession({ provider: "anthropic", id: "claude-opus-5" });

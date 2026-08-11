@@ -500,12 +500,16 @@ export default function modelRotation(pi: ExtensionAPI) {
 		},
 	});
 
+	/** Asking for a mode is asking for rotation: the head of the chain starts it, quota routing moves it before the next request. */
 	async function enterMode(next: Mode, ctx: ExtensionContext): Promise<void> {
+		requestedEnabled = true;
 		setMode(next, ctx);
 		const now = Date.now();
 		const { normal, lastResort } = hops(now);
 		const target = [...normal, ...lastResort][0];
 		if (target) await switchTo(target, ctx, `${next} mode`);
+		enabled = requestedEnabled && modeForModel(ctx.model) !== undefined;
+		updateStatus(ctx);
 	}
 
 	pi.registerCommand("mrc", {

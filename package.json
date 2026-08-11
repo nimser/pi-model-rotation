@@ -1,6 +1,6 @@
 {
   "name": "@nimser/pi-model-rotation",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "private": true,
   "type": "module",
   "description": "Private global pi extension for quota-aware model rotation",
