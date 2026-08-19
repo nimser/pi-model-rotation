@@ -287,7 +287,11 @@ function testQuotaCache() {
 }
 
 /** A fake session that records what rotation does to the model and its effort. */
-function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5" }, branch: unknown[] = []) {
+function fakeSession(
+	initialModel = { provider: "anthropic", id: "claude-opus-5" },
+	branch: unknown[] = [],
+	contextTokens: number | null = 0,
+) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
 	const statuses: string[] = [];
@@ -301,6 +305,7 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 		thinkingLevel: undefined,
 		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
 		sessionManager: { getBranch: () => branch, getLeafId: () => "leaf" },
+		getContextUsage: () => ({ tokens: contextTokens }),
 		isIdle: () => true,
 		hasPendingMessages: () => false,
 		ui: {
@@ -329,7 +334,18 @@ function fakeSession(initialModel = { provider: "anthropic", id: "claude-opus-5"
 		await handlers.get("after_provider_response")?.({ status: 429, headers: {} }, ctx);
 	};
 	const persistedState = () => [...appended].reverse().find((entry) => entry.type === "model-rotation-state")?.data;
-	return { ctx, commands, handlers, statuses, notices, at, limit, persistedState, setModelCalls: () => setModelCalls };
+	return {
+		ctx,
+		commands,
+		handlers,
+		statuses,
+		notices,
+		at,
+		limit,
+		persistedState,
+		setContextTokens: (tokens: number | null) => (contextTokens = tokens),
+		setModelCalls: () => setModelCalls,
+	};
 }
 
 async function modeCase(): Promise<string[]> {
@@ -413,7 +429,132 @@ async function modeCase(): Promise<string[]> {
 	return failures;
 }
 
-const cases: Record<string, () => Promise<string[]>> = { routing: routingCase, modes: modeCase };
+function modelKey(session: ReturnType<typeof fakeSession>): string {
+	return `${session.ctx.model?.provider}/${session.ctx.model?.id}`;
+}
+
+function pressuredAnthropicQuota(): QuotaEntry {
+	const now = Date.now();
+	return testQuota("anthropic", 9, {
+		windows: {
+			five_hour: { usedPercent: 20, resetsAt: new Date(now + 4 * 3_600_000).toISOString() },
+			seven_day: { usedPercent: 91, resetsAt: new Date(now + 3_600_000).toISOString() },
+		},
+	});
+}
+
+// --frontier-context-below
+async function frontierContextBelowCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	try {
+		cache.write([pressuredAnthropicQuota(), testQuota("openai-codex", 100)]);
+		const preferred = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], 271_999);
+		await preferred.handlers.get("before_agent_start")?.({}, preferred.ctx);
+		if (modelKey(preferred) !== "openai-codex/gpt-5.6-sol") failures.push(`271999 tokens did not override Anthropic weekly pressure: ${modelKey(preferred)}`);
+
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 0)]);
+		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 271_999);
+		await exhausted.handlers.get("before_agent_start")?.({}, exhausted.ctx);
+		if (modelKey(exhausted) !== "anthropic/claude-opus-5") failures.push(`context preference bypassed proven OpenAI exhaustion: ${modelKey(exhausted)}`);
+
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
+		const cooling = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 271_999);
+		await cooling.limit();
+		if (modelKey(cooling) !== "anthropic/claude-opus-5") failures.push(`context preference bypassed an OpenAI cooldown: ${modelKey(cooling)}`);
+	} finally {
+		cache.close();
+	}
+	return failures;
+}
+
+// --frontier-context-boundary
+async function frontierContextBoundaryCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	try {
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
+		const proactive = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		await proactive.handlers.get("before_agent_start")?.({}, proactive.ctx);
+		if (modelKey(proactive) !== "anthropic/claude-opus-5") failures.push(`272000-token request remained on OpenAI: ${modelKey(proactive)}`);
+
+		const above = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 400_000);
+		await above.handlers.get("before_agent_start")?.({}, above.ctx);
+		if (modelKey(above) !== "anthropic/claude-opus-5") failures.push(`above-boundary request remained on OpenAI: ${modelKey(above)}`);
+
+		const reactive = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], 272_000);
+		await reactive.limit();
+		if (modelKey(reactive) !== "opencode-go/kimi-k3") failures.push(`boundary 429 rotated to OpenAI: ${modelKey(reactive)}`);
+	} finally {
+		cache.close();
+	}
+	return failures;
+}
+
+// --frontier-context-fallback
+async function frontierContextFallbackCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	try {
+		cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 100)]);
+		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		await exhausted.handlers.get("before_agent_start")?.({}, exhausted.ctx);
+		if (modelKey(exhausted) !== "opencode-go/kimi-k3") failures.push(`Anthropic exhaustion did not reach Go at the boundary: ${modelKey(exhausted)}`);
+
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
+		const available = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		await available.handlers.get("before_agent_start")?.({}, available.ctx);
+		if (modelKey(available) !== "anthropic/claude-opus-5") failures.push(`Go preceded usable Anthropic at the boundary: ${modelKey(available)}`);
+	} finally {
+		cache.close();
+	}
+	return failures;
+}
+
+// --frontier-context-unknown
+async function frontierContextUnknownCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	try {
+		cache.write([pressuredAnthropicQuota(), testQuota("openai-codex", 100)]);
+		const compacted = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], null);
+		compacted.ctx.sessionManager.getSessionStats = () => ({ tokens: { total: 900_000 } });
+		await compacted.handlers.get("before_agent_start")?.({}, compacted.ctx);
+		if (modelKey(compacted) !== "openai-codex/gpt-5.6-sol") failures.push(`missing context usage did not follow below-boundary policy: ${modelKey(compacted)}`);
+	} finally {
+		cache.close();
+	}
+	return failures;
+}
+
+// --casual-context-regression
+async function casualContextRegressionCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	try {
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
+		for (const tokens of [271_999, 272_000]) {
+			const casual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" }, [], tokens);
+			await casual.handlers.get("before_agent_start")?.({}, casual.ctx);
+			if (modelKey(casual) !== "openai-codex/gpt-5.6-luna") failures.push(`casual normal route changed at ${tokens} tokens: ${modelKey(casual)}`);
+			await casual.limit();
+			if (modelKey(casual) !== "opencode-go/gpt-5.6-luna") failures.push(`casual last resort changed at ${tokens} tokens: ${modelKey(casual)}`);
+		}
+	} finally {
+		cache.close();
+	}
+	return failures;
+}
+
+const cases: Record<string, () => Promise<string[]>> = {
+	routing: routingCase,
+	modes: modeCase,
+	"frontier-context-below": frontierContextBelowCase,
+	"frontier-context-boundary": frontierContextBoundaryCase,
+	"frontier-context-fallback": frontierContextFallbackCase,
+	"frontier-context-unknown": frontierContextUnknownCase,
+	"casual-context-regression": casualContextRegressionCase,
+};
 const selected = requested.find((name) => name in cases);
 const failures = selected ? await cases[selected]() : await cacheCase();
 if (failures.length) {

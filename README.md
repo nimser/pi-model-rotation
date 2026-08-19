@@ -20,11 +20,19 @@ quota or cooling down from a 429. A 429 on Go while
 the OpenAI plan is also spent drops casual back to frontier — nothing ever
 promotes frontier to casual.
 
+Automatic frontier routing prefers `openai-codex/gpt-5.6-sol` while the active
+conversation context is below 272,000 tokens. A missing estimate after compaction
+also follows that below-boundary policy. At 272,000 tokens and above, OpenAI is
+removed from proactive and reactive frontier routing, so Anthropic is the normal
+route and Go remains the last resort. Casual mode is unchanged; its Codex Luna
+and Go Luna routes are not filtered by the frontier boundary.
+
 The extension paces weekly quotas toward their reset before comparing projected
-headroom. A provider must have positive immediate-window capacity before weekly
-pressure can select it. The first 429 is a backstop, and Go is selected only when
-every normal hop is cooling down from a 429 or has a fresh zero-capacity sample.
-OpenRouter is never a rotation target.
+headroom. Frontier's below-boundary OpenAI preference outranks that quota
+ranking, but it never bypasses a cooldown, a 429 newer than the quota sample, or
+proven immediate-window exhaustion. The first 429 is a backstop, and Go is
+selected only when every eligible normal hop is cooling down from a 429 or has a
+fresh zero-capacity sample. OpenRouter is never a rotation target.
 
 Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
 OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means

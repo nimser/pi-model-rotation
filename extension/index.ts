@@ -74,6 +74,7 @@ interface RotationConfig {
 }
 
 const FORBIDDEN_PROVIDERS = ["openrouter"];
+const FRONTIER_CONTEXT_LIMIT = 272_000;
 
 const DEFAULT_CONFIG: RotationConfig = {
 	modes: {
@@ -307,9 +308,13 @@ export default function modelRotation(pi: ExtensionAPI) {
 		updateStatus(ctx);
 	}
 
+	function contextEligible(entry: ChainEntry, contextTokens?: number): boolean {
+		return mode !== "frontier" || contextTokens === undefined || contextTokens < FRONTIER_CONTEXT_LIMIT || entry.provider !== "openai-codex";
+	}
+
 	/** Hops of the mode in preference order: the last resort trails everything else. */
-	function hops(now: number, skip?: ChainEntry): { normal: ChainEntry[]; lastResort: ChainEntry[] } {
-		const usable = chain.filter((entry) => entry !== skip && available(entry, now));
+	function hops(now: number, skip?: ChainEntry, contextTokens?: number): { normal: ChainEntry[]; lastResort: ChainEntry[] } {
+		const usable = chain.filter((entry) => entry !== skip && contextEligible(entry, contextTokens) && available(entry, now));
 		return { normal: usable.filter((entry) => !entry.lastResort), lastResort: usable.filter((entry) => entry.lastResort) };
 	}
 
@@ -321,37 +326,58 @@ export default function modelRotation(pi: ExtensionAPI) {
 		};
 	}
 
+	function blockedWithoutNewQuota(quotas: QuotaEntry[], provider: string): boolean {
+		const blockedAt = blockedAfter[provider] ?? 0;
+		return blockedAt > 0 && !quotas.some((entry) => entry.provider === provider && entry.active !== false && Date.parse(entry.fetchedAt ?? "") > blockedAt);
+	}
+
 	function targetFromQuotas(
 		quotas: QuotaEntry[],
 		ctx: ExtensionContext,
 		now: number,
+		contextTokens?: number,
 		skip?: ChainEntry,
 		allowUnknown = false,
 	): { entry: ChainEntry; reason: string } | undefined {
-		const { normal, lastResort } = hops(now, skip);
+		const { normal, lastResort } = hops(now, skip, contextTokens);
+		const belowFrontierLimit = mode === "frontier" && (contextTokens === undefined || contextTokens < FRONTIER_CONTEXT_LIMIT);
+		const preferred = belowFrontierLimit ? normal.find((entry) => entry.provider === "openai-codex") : undefined;
+		if (preferred && !blockedWithoutNewQuota(quotas, preferred.provider)
+			&& providerCapacity(quotas, preferred.provider, blockedAfter[preferred.provider] ?? 0, now) !== false) {
+			return { entry: preferred, reason: "frontier context" };
+		}
+
 		const normalProviders = new Set(normal.map((entry) => entry.provider));
 		const choice = chooseRoute(quotas.filter((entry) => normalProviders.has(entry.provider)), taskOptions(ctx));
 		const target = choice && normal.find((entry) => entry.provider === choice.provider);
 		if (target && choice) return { entry: target, reason: choice.reason };
 
-		if (allowUnknown) {
-			const unknown = normal.find((entry) => providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === undefined);
-			if (unknown) return { entry: unknown, reason: "rate limited" };
+		if (allowUnknown || mode === "frontier") {
+			const unknown = normal.find((entry) => !blockedWithoutNewQuota(quotas, entry.provider)
+				&& providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === undefined);
+			if (unknown) return { entry: unknown, reason: "quota unknown" };
 		}
 
-		const spent = chain
-			.filter((entry) => !entry.lastResort)
-			.every((entry) => !available(entry, now) || providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === false);
+		const eligibleNormal = chain.filter((entry) => entry !== skip && !entry.lastResort && contextEligible(entry, contextTokens));
+		const spent = eligibleNormal.every((entry) => !available(entry, now) || blockedWithoutNewQuota(quotas, entry.provider)
+			|| providerCapacity(quotas, entry.provider, blockedAfter[entry.provider] ?? 0, now) === false);
 		if (spent && lastResort[0]) return { entry: lastResort[0], reason: "last resort" };
 		return undefined;
 	}
 
+	function activeContextTokens(ctx: ExtensionContext): number | undefined {
+		if (mode !== "frontier") return undefined;
+		const tokens = ctx.getContextUsage()?.tokens;
+		return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined;
+	}
+
 	async function quotaTarget(ctx: ExtensionContext, now: number, skip?: ChainEntry, allowUnknown = false) {
 		try {
-			return targetFromQuotas(await readQuotas(), ctx, now, skip, allowUnknown);
+			const quotas = await readQuotas();
+			return targetFromQuotas(quotas, ctx, now, activeContextTokens(ctx), skip, allowUnknown);
 		} catch (error) {
 			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
-			return allowUnknown ? targetFromQuotas([], ctx, now, skip, true) : undefined;
+			return targetFromQuotas([], ctx, now, activeContextTokens(ctx), skip, allowUnknown);
 		}
 	}
 
