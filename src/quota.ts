@@ -23,6 +23,8 @@ export interface QuotaEntry {
 interface UsageWindow {
 	usedPercent: number;
 	resetsAt?: string;
+	/** Declared window length; pacing needs it to tell a short window from the long one. */
+	seconds?: number;
 }
 
 interface QuotaCache {
@@ -39,6 +41,10 @@ export interface RouteChoice {
 }
 
 const CACHE_MS = 180_000;
+const FIVE_HOUR_SECONDS = 18_000;
+const SEVEN_DAY_SECONDS = 604_800;
+/** Below a day a window is an immediate throttle, not a quota that expires unused. */
+const WEEKLY_MIN_SECONDS = 86_400;
 const RESERVE_PERCENT = 10;
 const HYSTERESIS_PERCENT = 10;
 const WEEKLY_PRESSURE_HYSTERESIS = 0.1;
@@ -87,14 +93,21 @@ function optionalIso(value: unknown): string | undefined {
 	return iso(value);
 }
 
-function usageWindow(used: unknown, reset: unknown): UsageWindow {
+function usageWindow(used: unknown, reset: unknown, seconds: number): UsageWindow {
 	const resetsAt = optionalIso(reset);
-	return { usedPercent: percentage(used), ...(resetsAt ? { resetsAt } : {}) };
+	return { usedPercent: percentage(used), ...(resetsAt ? { resetsAt } : {}), seconds };
 }
 
-function utilizationWindow(used: unknown, reset: unknown): UsageWindow {
+function utilizationWindow(used: unknown, reset: unknown, seconds: number): UsageWindow {
 	const resetsAt = optionalIso(reset);
-	return { usedPercent: utilizationPercentage(used), ...(resetsAt ? { resetsAt } : {}) };
+	return { usedPercent: utilizationPercentage(used), ...(resetsAt ? { resetsAt } : {}), seconds };
+}
+
+/** Names a window after its length, so an added plan window cannot occupy another one's slot. */
+function windowName(seconds: number): string {
+	if (seconds === FIVE_HOUR_SECONDS) return "five_hour";
+	if (seconds === SEVEN_DAY_SECONDS) return "seven_day";
+	return seconds < 86_400 ? `${Math.round(seconds / 3_600)}_hour` : `${Math.round(seconds / 86_400)}_day`;
 }
 
 function limitingWindow(windows: Record<string, UsageWindow>): UsageWindow {
@@ -176,8 +189,8 @@ function cachedAnthropic(credentials: { account: string; token: string; active: 
 			const ownedUntil = Math.max(Number(account?.nextPollAt) * 1000, fetchedAt + CACHE_MS) + 30_000;
 			if (!good || !Number.isFinite(fetchedAt) || now > ownedUntil) return [];
 			const windows = {
-				five_hour: usageWindow(good?.five_hour?.pct, good?.five_hour?.resets_at),
-				seven_day: usageWindow(good?.seven_day?.pct, good?.seven_day?.resets_at),
+				five_hour: usageWindow(good?.five_hour?.pct, good?.five_hour?.resets_at, FIVE_HOUR_SECONDS),
+				seven_day: usageWindow(good?.seven_day?.pct, good?.seven_day?.resets_at, SEVEN_DAY_SECONDS),
 			};
 			const limiting = limitingWindow(windows);
 			return [{
@@ -205,8 +218,8 @@ async function pollAnthropic(credential: { account: string; token: string; activ
 			"anthropic-beta": "oauth-2025-04-20",
 		});
 		const windows = {
-			five_hour: utilizationWindow(body?.five_hour?.utilization, body?.five_hour?.resets_at),
-			seven_day: utilizationWindow(body?.seven_day?.utilization, body?.seven_day?.resets_at),
+			five_hour: utilizationWindow(body?.five_hour?.utilization, body?.five_hour?.resets_at, FIVE_HOUR_SECONDS),
+			seven_day: utilizationWindow(body?.seven_day?.utilization, body?.seven_day?.resets_at, SEVEN_DAY_SECONDS),
 		};
 		const limiting = limitingWindow(windows);
 		return {
@@ -233,19 +246,31 @@ async function pollOpenAI(): Promise<QuotaEntry> {
 		const headers: Record<string, string> = { Authorization: `Bearer ${auth.access}` };
 		if (typeof auth.accountId === "string" && auth.accountId) headers["ChatGPT-Account-Id"] = auth.accountId;
 		const body = await jsonRequest(process.env.MODEL_ROTATION_OPENAI_USAGE_URL ?? "https://chatgpt.com/backend-api/wham/usage", headers);
-		const window = body?.rate_limit?.primary_window;
-		const usedPercent = percentage(window?.used_percent);
-		const resetsAt = iso(window?.reset_at);
+		// The plan throttles on a rolling five hours and meters the week; only the second one can expire unused.
+		const declared: [unknown, number][] = [
+			[body?.rate_limit?.primary_window, FIVE_HOUR_SECONDS],
+			[body?.rate_limit?.secondary_window, SEVEN_DAY_SECONDS],
+		];
+		const windows: Record<string, UsageWindow> = {};
+		for (const [raw, fallbackSeconds] of declared) {
+			const window = raw as { used_percent?: unknown; reset_at?: unknown; limit_window_seconds?: unknown } | undefined;
+			if (!window) continue;
+			const declaredSeconds = Number(window.limit_window_seconds);
+			const seconds = Number.isFinite(declaredSeconds) && declaredSeconds > 0 ? declaredSeconds : fallbackSeconds;
+			windows[windowName(seconds)] = usageWindow(window.used_percent, window.reset_at, seconds);
+		}
+		if (!Object.keys(windows).length) throw new Error("usage response omitted every rate limit window");
+		const limiting = limitingWindow(windows);
 		return {
 			provider: "openai-codex",
 			account: "openai-codex-1",
 			reachable: true,
 			active: true,
-			usedPercent,
-			remainingPercent: 100 - usedPercent,
-			resetsAt,
+			usedPercent: limiting.usedPercent,
+			remainingPercent: 100 - limiting.usedPercent,
+			resetsAt: summaryReset(windows),
 			fetchedAt: new Date().toISOString(),
-			windows: { primary: { usedPercent, resetsAt } },
+			windows,
 		};
 	} catch (error) {
 		return { provider: "openai-codex", account: "openai-codex-1", reachable: false, active: true, reason: safeReason(error) };
@@ -314,10 +339,11 @@ export async function readQuotas(options: { refresh?: boolean } = {}): Promise<Q
 	}
 }
 
-function weeklyWindow(entry: QuotaEntry): { usedPercent: number; resetsAt?: string } | undefined {
-	if (entry.provider === "anthropic") return entry.windows?.seven_day;
-	if (entry.provider === "openai-codex") return entry.windows?.primary;
-	return undefined;
+/** The longest declared window of a plan: the only quota whose leftover expires instead of refilling. */
+function weeklyWindow(entry: QuotaEntry): UsageWindow | undefined {
+	return Object.values(entry.windows ?? {})
+		.filter((window) => (window.seconds ?? 0) >= WEEKLY_MIN_SECONDS)
+		.sort((a, b) => (b.seconds as number) - (a.seconds as number))[0];
 }
 
 export function immediateCapacity(entry: QuotaEntry, now = Date.now()): boolean | undefined {

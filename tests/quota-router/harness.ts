@@ -55,7 +55,10 @@ async function cacheCase(): Promise<string[]> {
 			return;
 		}
 		if (request.url === "/openai") {
-			response.end(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1, reset_at: Math.floor(Date.now() / 1000) + 3600 } } }));
+			response.end(JSON.stringify({ rate_limit: {
+				primary_window: { used_percent: 1, limit_window_seconds: 18_000, reset_at: Math.floor(Date.now() / 1000) + 3600 },
+				secondary_window: { used_percent: 4, limit_window_seconds: 604_800, reset_at: Math.floor(Date.now() / 1000) + 6 * 86_400 },
+			} }));
 			return;
 		}
 
@@ -87,7 +90,8 @@ async function cacheCase(): Promise<string[]> {
 		const openai = entries.find((entry) => entry.provider === "openai-codex");
 		if (account1?.usedPercent !== 80 || account2?.usedPercent !== 20) failures.push(`Anthropic utilization was not parsed as a ratio: ${JSON.stringify([account1, account2])}`);
 		if (!account2?.reachable || account2.windows?.five_hour.resetsAt !== undefined || account2.resetsAt !== reset) failures.push(`missing per-window reset made account 2 unknown: ${JSON.stringify(account2)}`);
-		if (openai?.usedPercent !== 1 || openai.remainingPercent !== 99) failures.push(`OpenAI's 1% was not parsed as one percent: ${JSON.stringify(openai)}`);
+		if (openai?.usedPercent !== 4 || openai.remainingPercent !== 96) failures.push(`OpenAI's limiting window was not parsed as percentages: ${JSON.stringify(openai)}`);
+		if (openai?.windows?.five_hour?.usedPercent !== 1 || openai.windows.seven_day?.seconds !== 604_800) failures.push(`OpenAI's five-hour and weekly windows were not kept apart: ${JSON.stringify(openai?.windows)}`);
 		const go = entries.find((entry) => entry.provider === "opencode-go");
 		if (go?.reachable || !go?.reason) failures.push(`go should report as a last resort with no usage API: ${JSON.stringify(go)}`);
 		const afterFirst = requests;
@@ -154,38 +158,52 @@ async function routingCase(): Promise<string[]> {
 	if (inactive?.provider !== "openai-codex") failures.push("router selected an account it cannot activate");
 
 	const exhaustedShortWindow = entry("anthropic", "a1", 0, { burnPercentPerHour: 110, windows: {
-		five_hour: { usedPercent: 100, resetsAt },
-		seven_day: { usedPercent: 41, resetsAt: new Date(now + 36 * 3_600_000).toISOString() },
+		five_hour: { usedPercent: 100, resetsAt, seconds: 18_000 },
+		seven_day: { usedPercent: 41, resetsAt: new Date(now + 36 * 3_600_000).toISOString(), seconds: 604_800 },
 	} });
 	const openaiHeadroom = entry("openai-codex", "o1", 98, { windows: {
-		primary: { usedPercent: 2, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+		five_hour: { usedPercent: 2, resetsAt: new Date(now + 3 * 3_600_000).toISOString(), seconds: 18_000 },
+		seven_day: { usedPercent: 2, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
 	} });
 	const capacityGuard = chooseRoute([exhaustedShortWindow, openaiHeadroom], { currentProvider: "openai-codex" });
 	if (capacityGuard?.provider !== "openai-codex") failures.push(`weekly pressure bypassed exhausted immediate capacity: ${JSON.stringify(capacityGuard)}`);
 	if (providerCapacity([exhaustedShortWindow], "anthropic") !== false) failures.push("an exhausted current window was not proven spent");
 	if (chooseRoute([exhaustedShortWindow]) !== undefined) failures.push("an exhausted provider remained routable without another hop");
 
+	const expiringWeekly = entry("anthropic", "a1", 9, { burnPercentPerHour: 20, windows: {
+		five_hour: { usedPercent: 20, resetsAt: new Date(now + 4 * 3_600_000).toISOString(), seconds: 18_000 },
+		seven_day: { usedPercent: 91, resetsAt: new Date(now + 3_600_000).toISOString(), seconds: 604_800 },
+	} });
 	const expiry = chooseRoute([
-		entry("anthropic", "a1", 9, { burnPercentPerHour: 20, windows: {
-			five_hour: { usedPercent: 20, resetsAt: new Date(now + 4 * 3_600_000).toISOString() },
-			seven_day: { usedPercent: 91, resetsAt: new Date(now + 3_600_000).toISOString() },
-		} }),
+		expiringWeekly,
 		entry("openai-codex", "o1", 100, { windows: {
-			primary: { usedPercent: 0, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+			five_hour: { usedPercent: 0, resetsAt: new Date(now + 4 * 3_600_000).toISOString(), seconds: 18_000 },
+			seven_day: { usedPercent: 0, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
 		} }),
 	], { currentProvider: "openai-codex" });
 	if (expiry?.provider !== "anthropic" || expiry.reason !== "weekly expiry") failures.push(`weekly quota would expire unused: ${JSON.stringify(expiry)}`);
 
 	const shortWindow = chooseRoute([
 		entry("anthropic", "a1", 50, { windows: {
-			five_hour: { usedPercent: 50, resetsAt: new Date(now + 5 * 60_000).toISOString() },
-			seven_day: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+			five_hour: { usedPercent: 50, resetsAt: new Date(now + 5 * 60_000).toISOString(), seconds: 18_000 },
+			seven_day: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
 		} }),
 		entry("openai-codex", "o1", 50, { windows: {
-			primary: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString() },
+			five_hour: { usedPercent: 50, resetsAt: new Date(now + 3 * 3_600_000).toISOString(), seconds: 18_000 },
+			seven_day: { usedPercent: 50, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
 		} }),
 	], { currentProvider: "openai-codex" });
 	if (shortWindow?.provider !== "openai-codex") failures.push("five-hour expiry incorrectly drove weekly routing");
+
+	// A five-hour window emptying soon is a throttle, not a quota that expires: it must not claim the weekly trigger.
+	const rollingWindow = chooseRoute([
+		expiringWeekly,
+		entry("openai-codex", "o1", 98, { windows: {
+			five_hour: { usedPercent: 2, resetsAt: new Date(now + 20 * 60_000).toISOString(), seconds: 18_000 },
+			seven_day: { usedPercent: 2, resetsAt: new Date(now + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
+		} }),
+	], { currentProvider: "openai-codex" });
+	if (rollingWindow?.provider !== "anthropic" || rollingWindow.reason !== "weekly expiry") failures.push(`a rolling five-hour window stole the weekly trigger: ${JSON.stringify(rollingWindow)}`);
 
 	let registrations = 0;
 	const fakePi = {
@@ -262,9 +280,10 @@ function testQuota(provider: string, remainingPercent: number, extra: Partial<Qu
 		resetsAt,
 		fetchedAt: new Date().toISOString(),
 		burnPercentPerHour: 0,
-		windows: provider === "anthropic"
-			? { five_hour: { usedPercent: 100 - remainingPercent, resetsAt }, seven_day: { usedPercent: 20, resetsAt: new Date(Date.now() + 6 * 24 * 3_600_000).toISOString() } }
-			: { primary: { usedPercent: 100 - remainingPercent, resetsAt } },
+		windows: {
+			five_hour: { usedPercent: 100 - remainingPercent, resetsAt, seconds: 18_000 },
+			seven_day: { usedPercent: 20, resetsAt: new Date(Date.now() + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
+		},
 		...extra,
 	};
 }
@@ -359,7 +378,7 @@ async function modeCase(): Promise<string[]> {
 	if (frontier.at() !== "anthropic/claude-opus-5:medium") failures.push(`frontier did not start on opus at medium: ${frontier.at()}`);
 	frontier.ctx.thinkingLevel = "high"; // a manual bump the ladder must read back
 	await frontier.limit();
-	if (frontier.at() !== "openai-codex/gpt-5.6-sol:xhigh") failures.push(`opus high did not translate to sol xhigh: ${frontier.at()}`);
+	if (frontier.at() !== "openai-codex/gpt-6-astra:high") failures.push(`opus high did not carry to astra high: ${frontier.at()}`);
 	await frontier.limit();
 	if (frontier.at() !== "opencode-go/kimi-k3:max") failures.push(`go was not the frontier last resort: ${frontier.at()}`);
 	if (frontier.statuses.includes("rotation: casual")) failures.push("rotation promoted itself to casual");
@@ -394,7 +413,7 @@ async function modeCase(): Promise<string[]> {
 	if (reenabled.statuses.at(-1) !== "rotation: frontier") failures.push(`a mode command left the footer disabled: ${reenabled.statuses.at(-1)}`);
 	if (reenabled.persistedState()?.enabled !== true) failures.push(`a mode command persisted rotation as disabled: ${JSON.stringify(reenabled.persistedState())}`);
 	await reenabled.limit();
-	if (reenabled.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
+	if (reenabled.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
 
 	const reenabledCasual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
 	await reenabledCasual.commands.get("mrt")?.handler("", reenabledCasual.ctx);
@@ -404,7 +423,7 @@ async function modeCase(): Promise<string[]> {
 	cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 98)]);
 	const proactive = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	await proactive.handlers.get("before_agent_start")?.({}, proactive.ctx);
-	if (proactive.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`pre-agent quota routing did not avoid exhausted Anthropic: ${proactive.at()}`);
+	if (proactive.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`pre-agent quota routing did not avoid exhausted Anthropic: ${proactive.at()}`);
 
 	cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 0)]);
 	const directLastResort = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
@@ -414,7 +433,7 @@ async function modeCase(): Promise<string[]> {
 	cache.write([testQuota("anthropic", 80), { provider: "openai-codex", account: "openai-test", reachable: false, active: true, reason: "unavailable" }]);
 	const unknownNormal = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	await unknownNormal.limit();
-	if (unknownNormal.at() !== "openai-codex/gpt-5.6-sol:high") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
+	if (unknownNormal.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
 
 	const changing = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	const casualModel = { provider: "openai-codex", id: "gpt-5.6-luna" };
@@ -451,15 +470,15 @@ async function frontierContextBelowCase(): Promise<string[]> {
 		cache.write([pressuredAnthropicQuota(), testQuota("openai-codex", 100)]);
 		const preferred = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], 271_999);
 		await preferred.handlers.get("before_agent_start")?.({}, preferred.ctx);
-		if (modelKey(preferred) !== "openai-codex/gpt-5.6-sol") failures.push(`271999 tokens did not override Anthropic weekly pressure: ${modelKey(preferred)}`);
+		if (modelKey(preferred) !== "openai-codex/gpt-6-astra") failures.push(`271999 tokens did not override Anthropic weekly pressure: ${modelKey(preferred)}`);
 
 		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 0)]);
-		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 271_999);
+		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 271_999);
 		await exhausted.handlers.get("before_agent_start")?.({}, exhausted.ctx);
 		if (modelKey(exhausted) !== "anthropic/claude-opus-5") failures.push(`context preference bypassed proven OpenAI exhaustion: ${modelKey(exhausted)}`);
 
 		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
-		const cooling = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 271_999);
+		const cooling = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 271_999);
 		await cooling.limit();
 		if (modelKey(cooling) !== "anthropic/claude-opus-5") failures.push(`context preference bypassed an OpenAI cooldown: ${modelKey(cooling)}`);
 	} finally {
@@ -474,11 +493,11 @@ async function frontierContextBoundaryCase(): Promise<string[]> {
 	const cache = testQuotaCache();
 	try {
 		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
-		const proactive = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		const proactive = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 272_000);
 		await proactive.handlers.get("before_agent_start")?.({}, proactive.ctx);
 		if (modelKey(proactive) !== "anthropic/claude-opus-5") failures.push(`272000-token request remained on OpenAI: ${modelKey(proactive)}`);
 
-		const above = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 400_000);
+		const above = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 400_000);
 		await above.handlers.get("before_agent_start")?.({}, above.ctx);
 		if (modelKey(above) !== "anthropic/claude-opus-5") failures.push(`above-boundary request remained on OpenAI: ${modelKey(above)}`);
 
@@ -497,12 +516,12 @@ async function frontierContextFallbackCase(): Promise<string[]> {
 	const cache = testQuotaCache();
 	try {
 		cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 100)]);
-		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		const exhausted = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 272_000);
 		await exhausted.handlers.get("before_agent_start")?.({}, exhausted.ctx);
 		if (modelKey(exhausted) !== "opencode-go/kimi-k3") failures.push(`Anthropic exhaustion did not reach Go at the boundary: ${modelKey(exhausted)}`);
 
 		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
-		const available = fakeSession({ provider: "openai-codex", id: "gpt-5.6-sol" }, [], 272_000);
+		const available = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 272_000);
 		await available.handlers.get("before_agent_start")?.({}, available.ctx);
 		if (modelKey(available) !== "anthropic/claude-opus-5") failures.push(`Go preceded usable Anthropic at the boundary: ${modelKey(available)}`);
 	} finally {
@@ -520,7 +539,7 @@ async function frontierContextUnknownCase(): Promise<string[]> {
 		const compacted = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], null);
 		compacted.ctx.sessionManager.getSessionStats = () => ({ tokens: { total: 900_000 } });
 		await compacted.handlers.get("before_agent_start")?.({}, compacted.ctx);
-		if (modelKey(compacted) !== "openai-codex/gpt-5.6-sol") failures.push(`missing context usage did not follow below-boundary policy: ${modelKey(compacted)}`);
+		if (modelKey(compacted) !== "openai-codex/gpt-6-astra") failures.push(`missing context usage did not follow below-boundary policy: ${modelKey(compacted)}`);
 	} finally {
 		cache.close();
 	}

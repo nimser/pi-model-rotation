@@ -2,7 +2,7 @@
  * model-rotation — keep an unattended run alive across rate limits.
  *
  * Two modes follow the current model; /mrc and /mrf switch them by hand:
- *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-5.6-sol → opencode-go/kimi-k3
+ *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-6-astra → opencode-go/kimi-k3
  *   casual    openai-codex/gpt-5.6-luna → opencode-go/gpt-5.6-luna
  *
  * opencode-go is the last resort of its mode: it is picked only once every other
@@ -10,11 +10,11 @@
  * plan is also spent drops casual back to frontier; nothing ever promotes
  * frontier to casual.
  *
- * Effort travels as one ladder held on the Anthropic scale. gpt-5.6-sol runs one
- * notch above claude-opus-5, so opus medium ≡ sol high, opus high ≡ sol xhigh,
- * opus xhigh ≡ sol max, and a manual change is read back before every switch.
- * Entering a mode resets the ladder to that mode's default; rotating inside a
- * mode carries it.
+ * Effort travels as one ladder held on the Anthropic scale, and a manual change
+ * is read back before every switch. A hop whose scale is offset from Anthropic's
+ * declares effortOffset; gpt-6-astra shares the scale and takes the level as it
+ * stands. Entering a mode resets the ladder to that mode's default; rotating
+ * inside a mode carries it.
  *
  * Rules baked in by decision:
  *   - cached quota forecasts choose the route before a provider request
@@ -82,7 +82,7 @@ const DEFAULT_CONFIG: RotationConfig = {
 			ladder: "medium",
 			chain: [
 				{ provider: "anthropic", model: "claude-opus-5" },
-				{ provider: "openai-codex", model: "gpt-5.6-sol", effortOffset: 1 },
+				{ provider: "openai-codex", model: "gpt-6-astra" },
 				{ provider: "opencode-go", model: "kimi-k3", fixedThinking: "max", lastResort: true },
 			],
 		},

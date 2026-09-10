@@ -6,7 +6,7 @@ Private global pi package for quota-aware model rotation across the shared host 
 
 | mode | chain | last resort |
 |------|-------|-------------|
-| `frontier` | `anthropic/claude-opus-5` → `openai-codex/gpt-5.6-sol` | `opencode-go/kimi-k3` |
+| `frontier` | `anthropic/claude-opus-5` → `openai-codex/gpt-6-astra` | `opencode-go/kimi-k3` |
 | `casual` | `openai-codex/gpt-5.6-luna` | `opencode-go/gpt-5.6-luna` |
 
 The current model selects the mode at session start and whenever the model
@@ -20,7 +20,7 @@ quota or cooling down from a 429. A 429 on Go while
 the OpenAI plan is also spent drops casual back to frontier — nothing ever
 promotes frontier to casual.
 
-Automatic frontier routing prefers `openai-codex/gpt-5.6-sol` while the active
+Automatic frontier routing prefers `openai-codex/gpt-6-astra` while the active
 conversation context is below 272,000 tokens. A missing estimate after compaction
 also follows that below-boundary policy. At 272,000 tokens and above, OpenAI is
 removed from proactive and reactive frontier routing, so Anthropic is the normal
@@ -30,9 +30,14 @@ and Go Luna routes are not filtered by the frontier boundary.
 The extension paces weekly quotas toward their reset before comparing projected
 headroom. Frontier's below-boundary OpenAI preference outranks that quota
 ranking, but it never bypasses a cooldown, a 429 newer than the quota sample, or
-proven immediate-window exhaustion. The first 429 is a backstop, and Go is
-selected only when every eligible normal hop is cooling down from a 429 or has a
-fresh zero-capacity sample. OpenRouter is never a rotation target.
+proven immediate-window exhaustion. Pacing reads the longest window a plan
+declares — a window shorter than a day is a rolling throttle whose unused share
+never expires, so it cannot drive the weekly trigger. Anthropic publishes a
+five-hour and a seven-day window; OpenAI publishes the same pair as
+`primary_window` and `secondary_window`, and both are read. The first 429 is a
+backstop, and Go is selected only when every eligible normal hop is cooling down
+from a 429 or has a fresh zero-capacity sample. OpenRouter is never a rotation
+target.
 
 Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
 OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means
@@ -45,14 +50,9 @@ widget, and `/mru toggle` shows or hides it without changing quota state.
 
 ## Effort
 
-Effort travels as one ladder held on the Anthropic scale, because gpt-5.6-sol
-runs one notch above claude-opus-5:
-
-| ladder | claude-opus-5 | gpt-5.6-sol |
-|--------|---------------|-------------|
-| medium | medium | high |
-| high | high | xhigh |
-| xhigh | xhigh | max |
+Effort travels as one ladder held on the Anthropic scale. `gpt-6-astra` shares
+that scale and takes the level unchanged; a hop that runs hotter or cooler
+declares an `effortOffset` in its chain entry and renders the ladder through it.
 
 Entering frontier sets the ladder to `medium`, entering casual sets it to
 `xhigh`, and a manual change is read back before every switch, so rotating
@@ -62,7 +62,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.4
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.5
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

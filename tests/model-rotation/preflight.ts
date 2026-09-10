@@ -24,7 +24,7 @@ const server = createServer((request, response) => {
 		if (request.url?.startsWith("/healthy")) {
 			stats.healthy += 1;
 			response.writeHead(200, { "content-type": "text/event-stream" });
-			const base = { id: "fake-preflight", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "gpt-5.6-sol" };
+			const base = { id: "fake-preflight", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "gpt-6-astra" };
 			response.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: "PREFLIGHT_OK" }, finish_reason: null }] })}\n\n`);
 			response.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } })}\n\n`);
 			response.end("data: [DONE]\n\n");
@@ -54,14 +54,14 @@ export default function providers(pi) {
   });
   pi.registerProvider("openai-codex", {
     baseUrl: "http://127.0.0.1:${address.port}/healthy/v1", apiKey: "test", api: "openai-completions",
-    models: [{ id: "gpt-5.6-sol", name: "gpt-5.6-sol", ...defaults }],
+    models: [{ id: "gpt-6-astra", name: "gpt-6-astra", ...defaults }],
   });
 }
 `);
 writeFileSync(join(workdir, ".pi", "model-rotation.json"), JSON.stringify({
 	modes: { frontier: { ladder: "off", chain: [
 		{ provider: "fake-limited", model: "always-429" },
-		{ provider: "openai-codex", model: "gpt-5.6-sol" },
+		{ provider: "openai-codex", model: "gpt-6-astra" },
 	] } },
 }));
 const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
@@ -76,7 +76,10 @@ writeFileSync(quotaPath, JSON.stringify({ version: 1, fetchedAt: new Date().toIS
 	resetsAt,
 	fetchedAt: new Date().toISOString(),
 	burnPercentPerHour: 0,
-	windows: { primary: { usedPercent: 1, resetsAt } },
+	windows: {
+		five_hour: { usedPercent: 1, resetsAt, seconds: 18_000 },
+		seven_day: { usedPercent: 1, resetsAt: new Date(Date.now() + 6 * 24 * 3_600_000).toISOString(), seconds: 604_800 },
+	},
 }] }));
 
 function runPi(): Promise<{ code: number; output: string }> {
