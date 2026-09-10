@@ -60,7 +60,7 @@ notch below it:
 | high | high | medium |
 | xhigh | xhigh | high |
 
-Entering frontier sets the ladder to `medium`, entering casual sets it to
+Entering frontier sets the ladder to `high`, entering casual sets it to
 `xhigh`, and a manual change is read back before every switch, so rotating
 inside a mode carries the level you last chose. `kimi-k3` always runs at `max`
 and never moves the ladder.
@@ -68,7 +68,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.6
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.7
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

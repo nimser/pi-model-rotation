@@ -79,7 +79,7 @@ const FRONTIER_CONTEXT_LIMIT = 272_000;
 const DEFAULT_CONFIG: RotationConfig = {
 	modes: {
 		frontier: {
-			ladder: "medium",
+			ladder: "high",
 			chain: [
 				{ provider: "anthropic", model: "claude-opus-5" },
 				{ provider: "openai-codex", model: "gpt-6-astra", effortOffset: -1 },
