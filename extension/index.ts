@@ -10,11 +10,11 @@
  * plan is also spent drops casual back to frontier; nothing ever promotes
  * frontier to casual.
  *
- * Effort travels as one ladder held on the Anthropic scale, and a manual change
- * is read back before every switch. A hop whose scale is offset from Anthropic's
- * declares effortOffset; gpt-6-astra shares the scale and takes the level as it
- * stands. Entering a mode resets the ladder to that mode's default; rotating
- * inside a mode carries it.
+ * Effort travels as one ladder held on the Anthropic scale. gpt-6-astra reasons
+ * harder and costs more per token than claude-opus-5, so it runs one notch below
+ * the ladder: opus medium ≡ astra low, opus high ≡ astra medium, opus xhigh ≡
+ * astra high. A manual change is read back before every switch. Entering a mode
+ * resets the ladder to that mode's default; rotating inside a mode carries it.
  *
  * Rules baked in by decision:
  *   - cached quota forecasts choose the route before a provider request
@@ -82,7 +82,7 @@ const DEFAULT_CONFIG: RotationConfig = {
 			ladder: "medium",
 			chain: [
 				{ provider: "anthropic", model: "claude-opus-5" },
-				{ provider: "openai-codex", model: "gpt-6-astra" },
+				{ provider: "openai-codex", model: "gpt-6-astra", effortOffset: -1 },
 				{ provider: "opencode-go", model: "kimi-k3", fixedThinking: "max", lastResort: true },
 			],
 		},

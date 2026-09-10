@@ -50,9 +50,15 @@ widget, and `/mru toggle` shows or hides it without changing quota state.
 
 ## Effort
 
-Effort travels as one ladder held on the Anthropic scale. `gpt-6-astra` shares
-that scale and takes the level unchanged; a hop that runs hotter or cooler
-declares an `effortOffset` in its chain entry and renders the ladder through it.
+Effort travels as one ladder held on the Anthropic scale, because `gpt-6-astra`
+reasons harder and costs more per token than `claude-opus-5` and so runs one
+notch below it:
+
+| ladder | claude-opus-5 | gpt-6-astra |
+|--------|---------------|-------------|
+| medium | medium | low |
+| high | high | medium |
+| xhigh | xhigh | high |
 
 Entering frontier sets the ladder to `medium`, entering casual sets it to
 `xhigh`, and a manual change is read back before every switch, so rotating
@@ -62,7 +68,7 @@ and never moves the ladder.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.5
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.6
 ```
 
 Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.

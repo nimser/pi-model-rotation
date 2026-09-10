@@ -378,7 +378,7 @@ async function modeCase(): Promise<string[]> {
 	if (frontier.at() !== "anthropic/claude-opus-5:medium") failures.push(`frontier did not start on opus at medium: ${frontier.at()}`);
 	frontier.ctx.thinkingLevel = "high"; // a manual bump the ladder must read back
 	await frontier.limit();
-	if (frontier.at() !== "openai-codex/gpt-6-astra:high") failures.push(`opus high did not carry to astra high: ${frontier.at()}`);
+	if (frontier.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`opus high did not translate to astra medium: ${frontier.at()}`);
 	await frontier.limit();
 	if (frontier.at() !== "opencode-go/kimi-k3:max") failures.push(`go was not the frontier last resort: ${frontier.at()}`);
 	if (frontier.statuses.includes("rotation: casual")) failures.push("rotation promoted itself to casual");
@@ -413,7 +413,7 @@ async function modeCase(): Promise<string[]> {
 	if (reenabled.statuses.at(-1) !== "rotation: frontier") failures.push(`a mode command left the footer disabled: ${reenabled.statuses.at(-1)}`);
 	if (reenabled.persistedState()?.enabled !== true) failures.push(`a mode command persisted rotation as disabled: ${JSON.stringify(reenabled.persistedState())}`);
 	await reenabled.limit();
-	if (reenabled.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
+	if (reenabled.at() !== "openai-codex/gpt-6-astra:low") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
 
 	const reenabledCasual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
 	await reenabledCasual.commands.get("mrt")?.handler("", reenabledCasual.ctx);
@@ -423,7 +423,7 @@ async function modeCase(): Promise<string[]> {
 	cache.write([testQuota("anthropic", 0), testQuota("openai-codex", 98)]);
 	const proactive = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	await proactive.handlers.get("before_agent_start")?.({}, proactive.ctx);
-	if (proactive.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`pre-agent quota routing did not avoid exhausted Anthropic: ${proactive.at()}`);
+	if (proactive.at() !== "openai-codex/gpt-6-astra:low") failures.push(`pre-agent quota routing did not avoid exhausted Anthropic: ${proactive.at()}`);
 
 	cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 0)]);
 	const directLastResort = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
@@ -433,7 +433,7 @@ async function modeCase(): Promise<string[]> {
 	cache.write([testQuota("anthropic", 80), { provider: "openai-codex", account: "openai-test", reachable: false, active: true, reason: "unavailable" }]);
 	const unknownNormal = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	await unknownNormal.limit();
-	if (unknownNormal.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
+	if (unknownNormal.at() !== "openai-codex/gpt-6-astra:low") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
 
 	const changing = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
 	const casualModel = { provider: "openai-codex", id: "gpt-5.6-luna" };
