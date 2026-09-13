@@ -39,6 +39,23 @@ backstop, and Go is selected only when every eligible normal hop is cooling down
 from a 429 or has a fresh zero-capacity sample. OpenRouter is never a rotation
 target.
 
+## Exhaustion signals
+
+A spent plan does not always answer 429. ChatGPT out of credit replies HTTP 200
+and puts the verdict in the stream — `Codex error: The usage limit has been
+reached` — which reaches the extension as an assistant message with stop reason
+`error`. Rotation therefore reads the error text as well as the status: usage,
+plan, billing and credit exhaustion all rotate, while a full context window does
+not, because that is a prompt problem and blocking the plan would be wrong. When
+an error names its own wait ("Try again in ~14 min"), that wait becomes the
+cooldown; otherwise the provider's published reset does, falling back to the
+configured cooldown.
+
+pi retries a 429 itself once the model has changed, but it does not retry a
+stream error, so those runs continue through the queued continuation. Print mode
+(`pi -p`) never delivers extension follow-ups, so unattended continuation after a
+stream error exists only in an interactive session.
+
 Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
 OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means
 1% used, not 100% used.

@@ -9,5 +9,6 @@ bash "$here/quota-router/run-test.sh" --frontier-context-boundary
 bash "$here/quota-router/run-test.sh" --frontier-context-fallback
 bash "$here/quota-router/run-test.sh" --frontier-context-unknown
 bash "$here/quota-router/run-test.sh" --casual-context-regression
+node "$here/limit-messages/run-test.ts"
 node "$here/model-rotation/preflight.ts"
 bash "$here/model-rotation/run-test.sh"

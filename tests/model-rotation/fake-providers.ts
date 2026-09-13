@@ -1,5 +1,5 @@
 /**
- * Registers the two fake providers served by fake-provider.mjs so the
+ * Registers the fake providers served by fake-provider.mjs so the
  * model-rotation test never touches a real API.
  *
  * Port comes from FAKE_PROVIDER_PORT (default 8899).
@@ -23,6 +23,14 @@ export default function fakeProviders(pi: ExtensionAPI) {
 		apiKey: "test-key",
 		api: "openai-completions",
 		models: [{ id: "always-429", name: "always-429", ...modelDefaults }],
+	});
+
+	pi.registerProvider("fake-spent", {
+		name: "Fake (spent plan, HTTP 200)",
+		baseUrl: `http://127.0.0.1:${port}/spent/v1`,
+		apiKey: "test-key",
+		api: "openai-completions",
+		models: [{ id: "always-spent", name: "always-spent", ...modelDefaults }],
 	});
 
 	pi.registerProvider("fake-healthy", {

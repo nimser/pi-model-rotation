@@ -3,6 +3,7 @@
  * Two fake OpenAI-completions endpoints used to prove model-rotation works
  * without burning real quota:
  *   /limited/v1/chat/completions → always HTTP 429 (retry-after: 1)
+ *   /spent/v1/chat/completions   → HTTP 200 whose stream carries a spent-plan error
  *   /healthy/v1/chat/completions → valid SSE answer containing ROTATION_OK
  *
  * Usage: node fake-provider.mjs [port]   (default 8899)
@@ -11,7 +12,7 @@
 import { createServer } from "node:http";
 
 const port = Number(process.argv[2] ?? 8899);
-const stats = { limited: 0, healthy: 0 };
+const stats = { limited: 0, spent: 0, healthy: 0 };
 
 const server = createServer((req, res) => {
 	if (req.url === "/_stats") {
@@ -29,6 +30,15 @@ const server = createServer((req, res) => {
 			stats.limited += 1;
 			res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
 			res.end(JSON.stringify({ error: { message: "rate limit exceeded (fake)", type: "rate_limit_error" } }));
+			return;
+		}
+
+		// A spent ChatGPT plan answers 200 and puts the verdict in the stream.
+		if (req.url.startsWith("/spent")) {
+			stats.spent += 1;
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+			res.write(`data: ${JSON.stringify({ error: { message: "The usage limit has been reached", type: "usage_limit_reached" } })}\n\n`);
+			res.end();
 			return;
 		}
 

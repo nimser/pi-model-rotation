@@ -18,7 +18,7 @@
  *
  * Rules baked in by decision:
  *   - cached quota forecasts choose the route before a provider request
- *   - rotate on the FIRST 429 as a backstop, no N-in-a-window threshold
+ *   - rotate on the FIRST exhaustion signal as a backstop, no N-in-a-window threshold
  *   - a fixed cooldown never proves recovery; only a newer quota sample does
  *   - openrouter is never a rotation target, for any model
  *
@@ -27,10 +27,13 @@
  *      VERIFIED on pi 0.83.0: this hook does NOT fire for non-2xx responses
  *      (neither openai-completions nor anthropic-messages). Kept because it is
  *      free and the docs advertise it; layers 2+3 are what actually fire.
- *   2. message_end              → assistant message with stopReason "error"
- *                                 and a rate-limit-ish errorMessage
- *   3. agent_settled            → the run died on an error; trigger one hidden,
- *                                 entry-bound extension continuation
+ *   2. message_end              → assistant message with stopReason "error" and an
+ *                                 exhaustion errorMessage. A spent ChatGPT plan only
+ *                                 ever arrives this way: the Codex stream carries the
+ *                                 verdict as prose inside a 200 response.
+ *   3. agent_settled            → the run died on an error; trigger one hidden
+ *                                 continuation, dropped as stale once any turn
+ *                                 has completed or the operator has typed
  *
  * Config (optional): ~/.pi/agent/model-rotation.json or <cwd>/.pi/model-rotation.json
  *   { "modes": { "casual": { "chain": [...] } },
@@ -42,6 +45,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isRateLimitMessage, retryAfterSecondsFromMessage } from "../src/limits.ts";
 import { chooseRoute, providerCapacity, readQuotas, type QuotaEntry } from "../src/quota.ts";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -101,8 +105,6 @@ const DEFAULT_CONFIG: RotationConfig = {
 	rotateOnStatus: [429],
 };
 
-const RATE_LIMIT_RE = /rate.?limit|quota|429|too many requests|overloaded|insufficient.?(credit|quota|balance)/i;
-
 function loadConfig(cwd: string): RotationConfig {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 	const candidates = [join(cwd, ".pi", "model-rotation.json"), join(agentDir, "model-rotation.json")];
@@ -151,8 +153,9 @@ export default function modelRotation(pi: ExtensionAPI) {
 	const cooldownUntil = new Map<string, number>();
 	let rotations = 0;
 	let resumes = 0;
-	/** Bound to the exact post-rotation leaf so a later successful turn cancels it. */
-	let pendingResume: { leaf: string | undefined; to: string } | undefined;
+	/** Counts assistant messages that ended without an error, so a later good turn cancels a resume. */
+	let goodTurns = 0;
+	let pendingResume: { goodTurns: number; to: string } | undefined;
 	const lastLimitedAt = new Map<string, number>();
 	const blockedAfter: Record<string, number> = {};
 	let usageVisible = false;
@@ -371,14 +374,26 @@ export default function modelRotation(pi: ExtensionAPI) {
 		return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined;
 	}
 
-	async function quotaTarget(ctx: ExtensionContext, now: number, skip?: ChainEntry, allowUnknown = false) {
+	async function loadQuotas(): Promise<QuotaEntry[]> {
 		try {
-			const quotas = await readQuotas();
-			return targetFromQuotas(quotas, ctx, now, activeContextTokens(ctx), skip, allowUnknown);
+			return await readQuotas();
 		} catch (error) {
 			console.error(`[model-rotation] quota preflight unavailable: ${(error as Error).message}`);
-			return targetFromQuotas([], ctx, now, activeContextTokens(ctx), skip, allowUnknown);
+			return [];
 		}
+	}
+
+	async function quotaTarget(ctx: ExtensionContext, now: number, skip?: ChainEntry, allowUnknown = false, quotas?: QuotaEntry[]) {
+		return targetFromQuotas(quotas ?? (await loadQuotas()), ctx, now, activeContextTokens(ctx), skip, allowUnknown);
+	}
+
+	/** A plan that publishes its own reset outlives any guessed cooldown. */
+	function resetSeconds(quotas: QuotaEntry[], provider: string, now: number): number | undefined {
+		const resets = quotas
+			.filter((entry) => entry.provider === provider && entry.active === true && entry.resetsAt)
+			.map((entry) => Date.parse(entry.resetsAt as string))
+			.filter((at) => Number.isFinite(at) && at > now);
+		return resets.length ? (Math.max(...resets) - now) / 1000 : undefined;
 	}
 
 	/** Mark the failed model as limited and move to a quota-eligible hop. */
@@ -394,9 +409,11 @@ export default function modelRotation(pi: ExtensionAPI) {
 		if (failedKey) lastLimitedAt.set(failedKey, now);
 		syncLadder(ctx);
 
+		const quotas = await loadQuotas();
 		const failedEntry = failedModel && chain.find((entry) => entry.provider === failedModel.provider && entry.model === failedModel.id);
 		if (failedModel) {
-			block(failedModel.provider, failedModel.id, now + cooldownFor(failedModel.provider, retryAfterSeconds));
+			const wait = retryAfterSeconds ?? resetSeconds(quotas, failedModel.provider, now);
+			block(failedModel.provider, failedModel.id, now + cooldownFor(failedModel.provider, wait));
 			blockedAfter[failedModel.provider] = now;
 		}
 
@@ -407,10 +424,10 @@ export default function modelRotation(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify("model-rotation: casual exhausted → frontier", "warning");
 		}
 
-		const target = await quotaTarget(ctx, now, failedEntry, true);
+		const target = await quotaTarget(ctx, now, failedEntry, true, quotas);
 		if (target && await switchTo(target.entry, ctx, target.reason === "last resort" ? target.reason : reason)) {
 			rotations += 1;
-			pendingResume = config.autoResume ? { leaf: ctx.sessionManager.getLeafId(), to: key(target.entry.provider, target.entry.model) } : undefined;
+			pendingResume = config.autoResume ? { goodTurns, to: key(target.entry.provider, target.entry.model) } : undefined;
 			return true;
 		}
 		console.error("[model-rotation] every hop in the chain is cooling down, spent, or unusable");
@@ -440,10 +457,15 @@ export default function modelRotation(pi: ExtensionAPI) {
 	// Layer 2: the error surfaced as a finished assistant message.
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message as { role: string; provider?: string; model?: string; stopReason?: string; errorMessage?: string };
-		if (!enabled || message.role !== "assistant" || message.stopReason !== "error") return;
-		if (!RATE_LIMIT_RE.test(message.errorMessage ?? "")) return;
+		if (message.role !== "assistant") return;
+		if (message.stopReason !== "error") {
+			goodTurns += 1;
+			return;
+		}
+		if (!enabled) return;
+		if (!isRateLimitMessage(message.errorMessage)) return;
 		const failed = message.provider && message.model ? { provider: message.provider, id: message.model } : undefined;
-		await rotate(ctx, "rate limited", undefined, failed);
+		await rotate(ctx, "rate limited", retryAfterSecondsFromMessage(message.errorMessage), failed);
 	});
 
 	// Layer 3: the run stopped; resume it on the new model.
@@ -459,8 +481,8 @@ export default function modelRotation(pi: ExtensionAPI) {
 		const resume = pendingResume;
 		pendingResume = undefined;
 		if (!resume || !config.autoResume) return;
-		if (ctx.sessionManager.getLeafId() !== resume.leaf) {
-			console.error("[model-rotation] stale resume cancelled because the session advanced");
+		if (goodTurns !== resume.goodTurns) {
+			console.error("[model-rotation] stale resume cancelled because a turn already completed");
 			return;
 		}
 		if (resumes >= config.maxResumesPerSession) {

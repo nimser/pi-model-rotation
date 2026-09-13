@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# P0.1 DoD: a forced 429 on the primary continues the same task on the next model, unattended and visibly.
-# Case 1 is the openai-completions path, case 2 the anthropic-messages path; both hops are local, no quota spent.
+# P0.1 DoD: a spent primary continues the same task on the next model, unattended and visibly.
+# Case 1 is the openai-completions path, case 2 the anthropic-messages path, case 3 a spent
+# plan that answers HTTP 200 and names the limit in the stream; every hop is local.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,8 +25,10 @@ done
 
 fail=0
 
+# expect: "answer" when pi retries the request itself, "resume" when only the queued
+# continuation can carry the task — print mode never delivers extension follow-ups.
 run_case() {
-	local name="$1" provider="$2" model="$3" thinking="$4" extra_ext="$5"
+	local name="$1" provider="$2" model="$3" thinking="$4" extra_ext="$5" expect="${6:-answer}"
 	local workdir out before after
 	workdir="$(mktemp -d)"
 	workdirs+=("$workdir")
@@ -64,8 +67,12 @@ JSON
 	echo "=== case: $name (exit $status) ==="
 	cat "$out"
 
-	grep -q "ROTATION_OK" "$out" || { echo "FAIL[$name]: no answer from the healthy hop"; fail=1; }
 	grep -q "model-rotation. → fake-healthy/always-ok" "$out" || { echo "FAIL[$name]: rotation not logged"; fail=1; }
+	if [ "$expect" = "resume" ]; then
+		grep -q "resuming on fake-healthy/always-ok" "$out" || { echo "FAIL[$name]: no continuation queued on the new hop"; fail=1; }
+		return
+	fi
+	grep -q "ROTATION_OK" "$out" || { echo "FAIL[$name]: no answer from the healthy hop"; fail=1; }
 	[ "$after" -gt "$before" ] || { echo "FAIL[$name]: healthy hop never called"; fail=1; }
 }
 
@@ -93,9 +100,10 @@ trap 'cleanup; rm -f "/tmp/model-rotation-anthropic-429.$$.ts"' EXIT
 
 run_case "openai-completions path" fake-limited always-429 off ""
 run_case "anthropic-messages path" anthropic claude-haiku-4-5 off "/tmp/model-rotation-anthropic-429.$$.ts"
+run_case "spent plan inside a 200 stream" fake-spent always-spent off "" resume
 
 if [ "$fail" -eq 0 ]; then
-	echo "PASS: forced 429 continues unattended on the next hop, both API paths"
+	echo "PASS: a 429 continues on the next hop; a spent-plan stream error rotates and queues the continuation"
 else
 	exit 1
 fi
