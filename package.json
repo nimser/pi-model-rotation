@@ -3,7 +3,7 @@
   "version": "0.8.8",
   "private": true,
   "type": "module",
-  "description": "Private global pi extension for quota-aware model rotation",
+  "description": "Quota-aware model rotation across every AI subscription you pay for",
   "keywords": [
     "pi-package"
   ],

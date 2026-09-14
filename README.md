@@ -36,11 +36,13 @@ never rotation targets, and only models already authenticated in pi are used.
 ## Install
 
 ```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.8
+pi install git:github.com/nimser/pi-model-rotation
 ```
 
 Pi stores the checkout and the global package setting under `~/.pi/agent/`, so
-a shared home directory — host plus devpods — loads the same pinned tag.
+a shared home directory — host plus devpods — loads the same revision. Pin a
+commit with `@<sha>` to stop `pi update` from moving it.
+
 
 ## Default behaviour
 
@@ -75,8 +77,8 @@ again before the next request is sent.
 - **this project**: put a chain of one hop in `.pi/model-rotation.json`; the
   session is then pinned to that model with rotation active but nowhere to go.
 - **no automatic continuation, keep the routing**: `"autoResume": false`.
-- **everywhere**: `pi config` to disable the extension, or
-  `pi remove git:git@github.com:nimser/pi-model-rotation.git` to uninstall.
+- **everywhere**: `pi config` to disable the extension, or `pi remove` with the
+  source you installed to uninstall.
 
 ## Configuration
 
