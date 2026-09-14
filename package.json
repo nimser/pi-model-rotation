@@ -1,7 +1,8 @@
 {
   "name": "@nimser/pi-model-rotation",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Quota-aware model rotation across every AI subscription you pay for",
   "keywords": [

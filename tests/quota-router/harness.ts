@@ -310,6 +310,7 @@ function fakeSession(
 	initialModel = { provider: "anthropic", id: "claude-opus-5" },
 	branch: unknown[] = [],
 	contextTokens: number | null = 0,
+	cwd = join(REPO, "tests"),
 ) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, { handler: (...args: any[]) => Promise<void> }>();
@@ -318,7 +319,7 @@ function fakeSession(
 	const appended: Array<{ type: string; data: any }> = [];
 	let setModelCalls = 0;
 	const ctx: any = {
-		cwd: join(REPO, "tests"),
+		cwd,
 		hasUI: true,
 		model: initialModel,
 		thinkingLevel: undefined,
@@ -565,6 +566,49 @@ async function casualContextRegressionCase(): Promise<string[]> {
 	return failures;
 }
 
+// --configured-context-window
+async function configuredContextWindowCase(): Promise<string[]> {
+	const failures: string[] = [];
+	const cache = testQuotaCache();
+	const root = mkdtempSync(join(tmpdir(), "model-rotation-config-"));
+	try {
+		mkdirSync(join(root, ".pi"), { recursive: true });
+		writeFileSync(
+			join(root, ".pi", "model-rotation.json"),
+			JSON.stringify({
+				modes: {
+					frontier: {
+						ladder: "high",
+						chain: [
+							{ provider: "anthropic", model: "claude-opus-5", maxContextTokens: 150_000 },
+							{ provider: "openai-codex", model: "gpt-6-astra" },
+							{ provider: "opencode-go", model: "kimi-k3", fixedThinking: "max", lastResort: true },
+						],
+					},
+				},
+			}),
+		);
+		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
+
+		const below = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], 149_999, root);
+		await below.handlers.get("before_agent_start")?.({}, below.ctx);
+		if (modelKey(below) !== "anthropic/claude-opus-5") failures.push(`a configured window lost to headroom below its limit: ${modelKey(below)}`);
+
+		const above = fakeSession({ provider: "anthropic", id: "claude-opus-5" }, [], 150_000, root);
+		await above.handlers.get("before_agent_start")?.({}, above.ctx);
+		if (modelKey(above) !== "openai-codex/gpt-6-astra") failures.push(`a configured window kept its hop at the limit: ${modelKey(above)}`);
+
+		// The rule is the declared window, not the provider id: an OpenAI hop without one carries any context.
+		const wide = fakeSession({ provider: "openai-codex", id: "gpt-6-astra" }, [], 400_000, root);
+		await wide.handlers.get("before_agent_start")?.({}, wide.ctx);
+		if (modelKey(wide) !== "openai-codex/gpt-6-astra") failures.push(`a hop without a declared window was dropped by context: ${modelKey(wide)}`);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+		cache.close();
+	}
+	return failures;
+}
+
 const cases: Record<string, () => Promise<string[]>> = {
 	routing: routingCase,
 	modes: modeCase,
@@ -573,6 +617,7 @@ const cases: Record<string, () => Promise<string[]>> = {
 	"frontier-context-fallback": frontierContextFallbackCase,
 	"frontier-context-unknown": frontierContextUnknownCase,
 	"casual-context-regression": casualContextRegressionCase,
+	"configured-context-window": configuredContextWindowCase,
 };
 const selected = requested.find((name) => name in cases);
 const failures = selected ? await cases[selected]() : await cacheCase();

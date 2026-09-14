@@ -17,6 +17,7 @@
  * resets the ladder to that mode's default; rotating inside a mode carries it.
  *
  * Rules baked in by decision:
+ *   - a hop that declares maxContextTokens is preferred while the conversation fits it
  *   - cached quota forecasts choose the route before a provider request
  *   - rotate on the FIRST exhaustion signal as a backstop, no N-in-a-window threshold
  *   - a fixed cooldown never proves recovery; only a newer quota sample does
@@ -62,6 +63,8 @@ interface ChainEntry {
 	fixedThinking?: ThinkingLevel;
 	/** Picked only when every other hop of the mode is exhausted. */
 	lastResort?: boolean;
+	/** Context window of the hop: preferred while the conversation fits it, dropped once it does not. */
+	maxContextTokens?: number;
 }
 
 interface ModeConfig {
@@ -78,7 +81,7 @@ interface RotationConfig {
 }
 
 const FORBIDDEN_PROVIDERS = ["openrouter"];
-const FRONTIER_CONTEXT_LIMIT = 272_000;
+const ASTRA_CONTEXT_WINDOW = 272_000;
 
 const DEFAULT_CONFIG: RotationConfig = {
 	modes: {
@@ -86,7 +89,7 @@ const DEFAULT_CONFIG: RotationConfig = {
 			ladder: "high",
 			chain: [
 				{ provider: "anthropic", model: "claude-opus-5" },
-				{ provider: "openai-codex", model: "gpt-6-astra", effortOffset: -1 },
+				{ provider: "openai-codex", model: "gpt-6-astra", effortOffset: -1, maxContextTokens: ASTRA_CONTEXT_WINDOW },
 				{ provider: "opencode-go", model: "kimi-k3", fixedThinking: "max", lastResort: true },
 			],
 		},
@@ -312,7 +315,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	}
 
 	function contextEligible(entry: ChainEntry, contextTokens?: number): boolean {
-		return mode !== "frontier" || contextTokens === undefined || contextTokens < FRONTIER_CONTEXT_LIMIT || entry.provider !== "openai-codex";
+		return entry.maxContextTokens === undefined || contextTokens === undefined || contextTokens < entry.maxContextTokens;
 	}
 
 	/** Hops of the mode in preference order: the last resort trails everything else. */
@@ -343,11 +346,11 @@ export default function modelRotation(pi: ExtensionAPI) {
 		allowUnknown = false,
 	): { entry: ChainEntry; reason: string } | undefined {
 		const { normal, lastResort } = hops(now, skip, contextTokens);
-		const belowFrontierLimit = mode === "frontier" && (contextTokens === undefined || contextTokens < FRONTIER_CONTEXT_LIMIT);
-		const preferred = belowFrontierLimit ? normal.find((entry) => entry.provider === "openai-codex") : undefined;
+		// hops() already dropped the hops the context outgrew, so a survivor that declares a window still fits it.
+		const preferred = normal.find((entry) => entry.maxContextTokens !== undefined);
 		if (preferred && !blockedWithoutNewQuota(quotas, preferred.provider)
 			&& providerCapacity(quotas, preferred.provider, blockedAfter[preferred.provider] ?? 0, now) !== false) {
-			return { entry: preferred, reason: "frontier context" };
+			return { entry: preferred, reason: "context fit" };
 		}
 
 		const normalProviders = new Set(normal.map((entry) => entry.provider));
@@ -369,7 +372,7 @@ export default function modelRotation(pi: ExtensionAPI) {
 	}
 
 	function activeContextTokens(ctx: ExtensionContext): number | undefined {
-		if (mode !== "frontier") return undefined;
+		if (!chain.some((entry) => entry.maxContextTokens !== undefined)) return undefined;
 		const tokens = ctx.getContextUsage()?.tokens;
 		return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined;
 	}

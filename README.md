@@ -93,7 +93,7 @@ keep their defaults.
       "ladder": "high",
       "chain": [
         { "provider": "anthropic", "model": "claude-opus-5" },
-        { "provider": "openai-codex", "model": "gpt-6-astra", "effortOffset": -1 },
+        { "provider": "openai-codex", "model": "gpt-6-astra", "effortOffset": -1, "maxContextTokens": 272000 },
         { "provider": "opencode-go", "model": "kimi-k3", "fixedThinking": "max", "lastResort": true }
       ]
     }
@@ -121,10 +121,9 @@ Chain entries take `provider` and `model`, plus:
 | `effortOffset` | notches away from the ladder for this hop |
 | `fixedThinking` | one effort level, ignoring the ladder |
 | `lastResort` | reachable only when every other hop of the mode is unusable |
+| `maxContextTokens` | the hop's context window: preferred while the conversation fits it, dropped once it does not |
 
-Mode names are fixed: only `frontier` and `casual` exist, and the 272,000-token
-context rule below applies to the provider id `openai-codex`, so a frontier
-chain built on other providers keeps quota routing but not that rule.
+Mode names are fixed: only `frontier` and `casual` exist.
 
 | variable | effect |
 |----------|--------|
@@ -147,13 +146,19 @@ window; OpenAI publishes the same pair as `primary_window` and
 `secondary_window`, and both are read. A 429 is a backstop, never the primary
 signal, and no fixed cooldown proves recovery — only a newer quota sample does.
 
-Frontier prefers `openai-codex/gpt-6-astra` while the active conversation
-context is below 272,000 tokens, and a missing estimate after compaction
-follows the same below-boundary policy. That preference outranks the quota
-ranking but never bypasses a cooldown, a 429 newer than the quota sample, or
-proven immediate-window exhaustion. At 272,000 tokens and above, OpenAI leaves
-both proactive and reactive frontier routing, Anthropic becomes the normal
-route and Go stays the last resort. Casual mode is unchanged by that boundary.
+A hop that declares `maxContextTokens` is preferred while the active
+conversation fits inside it, and leaves both proactive and reactive routing
+once it does not — a narrow model is worth using until the conversation
+outgrows it, and is worthless afterwards. A missing estimate, which is what pi
+reports right after compaction, counts as fitting. The preference outranks the
+quota ranking but never bypasses a cooldown, a 429 newer than the quota sample,
+or proven immediate-window exhaustion; a hop that declares no window carries
+any context.
+
+By default only `openai-codex/gpt-6-astra` declares one, at its 272,000-token
+window, so frontier runs on Codex until the conversation crosses it and on
+Anthropic afterwards, with Go still the last resort. Casual mode declares no
+window and is unchanged by conversation size.
 
 Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct`
 and OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore
