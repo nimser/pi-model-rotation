@@ -1,8 +1,50 @@
 # pi-model-rotation
 
-Private global pi package for quota-aware model rotation across the shared host and every devpod.
+A pi extension that spreads one agent session across every AI subscription you
+already pay for: each request goes to the plan that can best afford it, and a
+plan that runs out is left behind without stopping the run.
 
-## Modes
+## Why
+
+Frontier plans meter themselves in their own windows — Anthropic on five hours
+and seven days, ChatGPT on a rolling five hours and a week, OpenCode Go on a
+month. A session pinned to one model wastes that:
+
+- it stalls at a limit while the other subscriptions sit untouched;
+- the weekly allowance you paid for expires unused, because nothing spends it
+  before the reset;
+- an unattended run dies at the first 429 and waits for a human to swap the
+  model and retype the request.
+
+The goal is to keep every subscription near full use and every run alive:
+predict which plan has headroom before the request leaves, rotate on the first
+exhaustion signal, and continue the interrupted turn on the new model. Quotas
+expire used, not unused.
+
+It is not a spend-more router. OpenRouter and other pay-per-token gateways are
+never rotation targets, and only models already authenticated in pi are used.
+
+## Requirements
+
+- pi 0.84.2 or newer, for `ctx.getContextUsage()`
+- Node 26 or newer
+- credentials in pi for every provider in your chains; a hop pi cannot
+  authenticate is skipped and cooled down
+- optional: [claude-swap](https://github.com/realiti4/claude-swap) for reading
+  several Anthropic accounts' quota
+
+## Install
+
+```bash
+pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.8
+```
+
+Pi stores the checkout and the global package setting under `~/.pi/agent/`, so
+a shared home directory — host plus devpods — loads the same pinned tag.
+
+## Default behaviour
+
+Two modes, each a chain of hops in preference order:
 
 | mode | chain | last resort |
 |------|-------|-------------|
@@ -10,34 +52,110 @@ Private global pi package for quota-aware model rotation across the shared host 
 | `casual` | `openai-codex/gpt-5.6-luna` | `opencode-go/gpt-5.6-luna` |
 
 The current model selects the mode at session start and whenever the model
-changes. A model in neither chain disables rotation. Use `/mrf` for frontier
-mode or `/mrc` for casual mode; the footer shows the active mode. Asking for a
-mode also turns rotation on, because a disabled router has no mode to be in. The
-command starts at the head of its chain and the quota router moves it before the
-next request is sent. opencode-go
-is the last resort of its mode and is picked only once every other hop is out of
-quota or cooling down from a 429. A 429 on Go while
-the OpenAI plan is also spent drops casual back to frontier — nothing ever
-promotes frontier to casual.
+changes. A model in neither chain disables rotation. The last resort is entered
+only once every other hop of the mode is out of quota or cooling down from a
+429. A 429 on the last resort while the normal hops are also spent drops casual
+back to frontier; nothing ever promotes frontier to casual.
 
-Automatic frontier routing prefers `openai-codex/gpt-6-astra` while the active
-conversation context is below 272,000 tokens. A missing estimate after compaction
-also follows that below-boundary policy. At 272,000 tokens and above, OpenAI is
-removed from proactive and reactive frontier routing, so Anthropic is the normal
-route and Go remains the last resort. Casual mode is unchanged; its Codex Luna
-and Go Luna routes are not filtered by the frontier boundary.
+| command | effect |
+|---------|--------|
+| `/mrf` | frontier mode, from the head of its chain |
+| `/mrc` | casual mode, from the head of its chain |
+| `/mrt` | turn rotation off, or back on, for this session |
+| `/mru` | refresh and show quota, mode, effort and counters; `hide` clears the widget, `toggle` shows or hides it |
+
+Asking for a mode also turns rotation on, because a disabled router has no mode
+to be in. The footer shows the active mode. The quota router moves the model
+again before the next request is sent.
+
+## Turning it off
+
+- **this session**: `/mrt`, or switch to a model that is in neither chain —
+  rotation reports the model as unsupported and stands down.
+- **this project**: put a chain of one hop in `.pi/model-rotation.json`; the
+  session is then pinned to that model with rotation active but nowhere to go.
+- **no automatic continuation, keep the routing**: `"autoResume": false`.
+- **everywhere**: `pi config` to disable the extension, or
+  `pi remove git:git@github.com:nimser/pi-model-rotation.git` to uninstall.
+
+## Configuration
+
+`.pi/model-rotation.json` in the project is read first, then
+`~/.pi/agent/model-rotation.json`; the first readable file wins and unset keys
+keep their defaults.
+
+```json
+{
+  "modes": {
+    "frontier": {
+      "ladder": "high",
+      "chain": [
+        { "provider": "anthropic", "model": "claude-opus-5" },
+        { "provider": "openai-codex", "model": "gpt-6-astra", "effortOffset": -1 },
+        { "provider": "opencode-go", "model": "kimi-k3", "fixedThinking": "max", "lastResort": true }
+      ]
+    }
+  },
+  "cooldownMs": { "anthropic": 300000, "opencode-go": 18000000, "default": 900000 },
+  "maxResumesPerSession": 5,
+  "autoResume": true,
+  "rotateOnStatus": [429]
+}
+```
+
+| key | meaning |
+|-----|---------|
+| `modes.<mode>.chain` | hops in preference order; an empty chain keeps the built-in one |
+| `modes.<mode>.ladder` | effort the mode starts at, on the Anthropic scale |
+| `cooldownMs.<provider>` | how long a provider is avoided after an exhaustion signal that names no reset; `default` covers the rest |
+| `maxResumesPerSession` | how many times a session may continue itself after a rotation |
+| `autoResume` | continue the interrupted turn on the new model |
+| `rotateOnStatus` | HTTP statuses treated as exhaustion |
+
+Chain entries take `provider` and `model`, plus:
+
+| field | meaning |
+|-------|---------|
+| `effortOffset` | notches away from the ladder for this hop |
+| `fixedThinking` | one effort level, ignoring the ladder |
+| `lastResort` | reachable only when every other hop of the mode is unusable |
+
+Mode names are fixed: only `frontier` and `casual` exist, and the 272,000-token
+context rule below applies to the provider id `openai-codex`, so a frontier
+chain built on other providers keeps quota routing but not that rule.
+
+| variable | effect |
+|----------|--------|
+| `MODEL_ROTATION_TASK_MINUTES` | expected task length used to project headroom (default 60) |
+| `MODEL_ROTATION_QUOTA_CACHE` | quota cache path (default `~/.pi/agent/cache/model-rotation/quota.json`) |
+| `MODEL_ROTATION_CSWAP_DIR` | claude-swap directory (default `~/.local/share/claude-swap`) |
+| `MODEL_ROTATION_IGNORE_CSWAP_USAGE` | `1` polls Anthropic directly instead of reading claude-swap's cache |
+| `MODEL_ROTATION_ANTHROPIC_USAGE_URL` | override the Anthropic usage endpoint |
+| `MODEL_ROTATION_OPENAI_USAGE_URL` | override the ChatGPT usage endpoint |
+| `MODEL_ROTATION_PI_AUTH` | pi credential file to read the Codex token from |
+
+## Routing
 
 The extension paces weekly quotas toward their reset before comparing projected
-headroom. Frontier's below-boundary OpenAI preference outranks that quota
-ranking, but it never bypasses a cooldown, a 429 newer than the quota sample, or
-proven immediate-window exhaustion. Pacing reads the longest window a plan
-declares — a window shorter than a day is a rolling throttle whose unused share
-never expires, so it cannot drive the weekly trigger. Anthropic publishes a
-five-hour and a seven-day window; OpenAI publishes the same pair as
-`primary_window` and `secondary_window`, and both are read. The first 429 is a
-backstop, and Go is selected only when every eligible normal hop is cooling down
-from a 429 or has a fresh zero-capacity sample. OpenRouter is never a rotation
-target.
+headroom, so a plan whose week is ahead of schedule yields to one that is
+behind. Pacing reads the longest window a plan declares: a window shorter than
+a day is a rolling throttle whose unused share never expires, so it cannot
+drive the weekly trigger. Anthropic publishes a five-hour and a seven-day
+window; OpenAI publishes the same pair as `primary_window` and
+`secondary_window`, and both are read. A 429 is a backstop, never the primary
+signal, and no fixed cooldown proves recovery — only a newer quota sample does.
+
+Frontier prefers `openai-codex/gpt-6-astra` while the active conversation
+context is below 272,000 tokens, and a missing estimate after compaction
+follows the same below-boundary policy. That preference outranks the quota
+ranking but never bypasses a cooldown, a 429 newer than the quota sample, or
+proven immediate-window exhaustion. At 272,000 tokens and above, OpenAI leaves
+both proactive and reactive frontier routing, Anthropic becomes the normal
+route and Go stays the last resort. Casual mode is unchanged by that boundary.
+
+Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct`
+and OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore
+means 1% used, not 100% used.
 
 ## Exhaustion signals
 
@@ -45,25 +163,16 @@ A spent plan does not always answer 429. ChatGPT out of credit replies HTTP 200
 and puts the verdict in the stream — `Codex error: The usage limit has been
 reached` — which reaches the extension as an assistant message with stop reason
 `error`. Rotation therefore reads the error text as well as the status: usage,
-plan, billing and credit exhaustion all rotate, while a full context window does
-not, because that is a prompt problem and blocking the plan would be wrong. When
-an error names its own wait ("Try again in ~14 min"), that wait becomes the
-cooldown; otherwise the provider's published reset does, falling back to the
-configured cooldown.
+plan, billing and credit exhaustion all rotate, while a full context window
+does not, because that is a prompt problem and blocking the plan would be
+wrong. When an error names its own wait ("Try again in ~14 min"), that wait
+becomes the cooldown; otherwise the provider's published reset does, falling
+back to the configured cooldown.
 
-pi retries a 429 itself once the model has changed, but it does not retry a
-stream error, so those runs continue through the queued continuation. Print mode
-(`pi -p`) never delivers extension follow-ups, so unattended continuation after a
-stream error exists only in an interactive session.
-
-Anthropic's live `utilization` fields are ratios; claude-swap's cached `pct` and
-OpenAI's `used_percent` are percentages. An OpenAI value of `1` therefore means
-1% used, not 100% used.
-
-`/mrt` disables or re-enables rotation for the current session; `/mrf` and
-`/mrc` re-enable it as well. `/mru` refreshes
-and shows quota details and routing counters; `/mru hide` clears the usage
-widget, and `/mru toggle` shows or hides it without changing quota state.
+Pi retries a 429 itself once the model has changed, but it does not retry a
+stream error, so those runs continue through the queued continuation. Print
+mode (`pi -p`) never delivers extension follow-ups, so unattended continuation
+after a stream error exists only in an interactive session.
 
 ## Effort
 
@@ -82,40 +191,6 @@ Entering frontier sets the ladder to `high`, entering casual sets it to
 inside a mode carries the level you last chose. `kimi-k3` always runs at `max`
 and never moves the ladder.
 
-## Install
-
-```bash
-pi install git:git@github.com:nimser/pi-model-rotation.git@v0.8.7
-```
-
-Pi stores the checkout and global package setting under the shared `~/.pi/agent/`, so host and devpods load the same pinned tag.
-
-## Configuration
-
-Optional global config: `~/.pi/agent/model-rotation.json`.
-Optional project override: `.pi/model-rotation.json`.
-
-```json
-{
-  "modes": { "casual": { "ladder": "xhigh", "chain": [] } },
-  "cooldownMs": { "anthropic": 300000, "default": 900000 },
-  "maxResumesPerSession": 5,
-  "autoResume": true
-}
-```
-
-Environment overrides:
-
-- `MODEL_ROTATION_TASK_MINUTES`
-- `MODEL_ROTATION_QUOTA_CACHE`
-- `MODEL_ROTATION_CSWAP_DIR`
-- `MODEL_ROTATION_IGNORE_CSWAP_USAGE`
-- `MODEL_ROTATION_ANTHROPIC_USAGE_URL`
-- `MODEL_ROTATION_OPENAI_USAGE_URL`
-- `MODEL_ROTATION_PI_AUTH`
-
-The default cache is shared at `~/.pi/agent/cache/model-rotation/quota.json`.
-
 ## OpenCode Go quota
 
 There is none, by design. The key buys inference only, responses carry no
@@ -130,8 +205,8 @@ is spent and left on a 429 or when a plan recovers. A number that changes
 nothing is not worth a weekly parse of somebody else's docs, so `/mru` prints
 `last resort; no usage API` instead of a figure it cannot check.
 
-The one consequence that is handled: Go's shortest window is five rolling hours,
-so its cooldown after a 429 is five hours rather than the fifteen-minute
+The one consequence that is handled: Go's shortest window is five rolling
+hours, so its cooldown after a 429 is five hours rather than the fifteen-minute
 default, and a `Retry-After` is believed up to a day.
 
 ## Development
