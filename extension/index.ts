@@ -3,7 +3,7 @@
  *
  * Two modes follow the current model; /mrc and /mrf switch them by hand:
  *   frontier  anthropic/claude-opus-5 → openai-codex/gpt-6-astra → opencode-go/kimi-k3
- *   casual    openai-codex/gpt-5.6-luna → opencode-go/gpt-5.6-luna
+ *   casual    openai-codex/gpt-6-luna → opencode-go/gpt-6-luna
  *
  * opencode-go is the last resort of its mode: it is picked only once every other
  * hop is out of quota or cooling down from a 429. A 429 on Go while the OpenAI
@@ -96,8 +96,8 @@ const DEFAULT_CONFIG: RotationConfig = {
 		casual: {
 			ladder: "xhigh",
 			chain: [
-				{ provider: "openai-codex", model: "gpt-5.6-luna" },
-				{ provider: "opencode-go", model: "gpt-5.6-luna", lastResort: true },
+				{ provider: "openai-codex", model: "gpt-6-luna" },
+				{ provider: "opencode-go", model: "gpt-6-luna", lastResort: true },
 			],
 		},
 	},

@@ -384,13 +384,13 @@ async function modeCase(): Promise<string[]> {
 	if (frontier.at() !== "opencode-go/kimi-k3:max") failures.push(`go was not the frontier last resort: ${frontier.at()}`);
 	if (frontier.statuses.includes("rotation: casual")) failures.push("rotation promoted itself to casual");
 
-	const casual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
+	const casual = fakeSession({ provider: "openai-codex", id: "gpt-6-luna" });
 	if (casual.statuses[0] !== "rotation: casual") failures.push(`casual model did not select casual mode: ${casual.statuses[0]}`);
 	await casual.commands.get("mrc")?.handler("", casual.ctx);
-	if (casual.at() !== "openai-codex/gpt-5.6-luna:xhigh") failures.push(`casual did not overwrite effort to xhigh: ${casual.at()}`);
+	if (casual.at() !== "openai-codex/gpt-6-luna:xhigh") failures.push(`casual did not overwrite effort to xhigh: ${casual.at()}`);
 	casual.ctx.thinkingLevel = "high"; // inside casual the level travels untouched
 	await casual.limit();
-	if (casual.at() !== "opencode-go/gpt-5.6-luna:high") failures.push(`casual pair did not keep its effort: ${casual.at()}`);
+	if (casual.at() !== "opencode-go/gpt-6-luna:high") failures.push(`casual pair did not keep its effort: ${casual.at()}`);
 	await casual.limit();
 	if (casual.at() !== "anthropic/claude-opus-5:high") failures.push(`spent casual did not fall back to frontier: ${casual.at()}`);
 	if (casual.statuses.at(-1) !== "rotation: frontier") failures.push(`mode was not reported as frontier: ${casual.statuses.at(-1)}`);
@@ -416,7 +416,7 @@ async function modeCase(): Promise<string[]> {
 	await reenabled.limit();
 	if (reenabled.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`rotation stayed disabled after a mode command: ${reenabled.at()}`);
 
-	const reenabledCasual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" });
+	const reenabledCasual = fakeSession({ provider: "openai-codex", id: "gpt-6-luna" });
 	await reenabledCasual.commands.get("mrt")?.handler("", reenabledCasual.ctx);
 	await reenabledCasual.commands.get("mrc")?.handler("", reenabledCasual.ctx);
 	if (reenabledCasual.statuses.at(-1) !== "rotation: casual" || reenabledCasual.persistedState()?.enabled !== true) failures.push(`casual mode did not re-enable rotation: ${reenabledCasual.statuses.at(-1)}`);
@@ -437,7 +437,7 @@ async function modeCase(): Promise<string[]> {
 	if (unknownNormal.at() !== "openai-codex/gpt-6-astra:medium") failures.push(`unknown OpenAI quota was skipped for Go without exhaustion proof: ${unknownNormal.at()}`);
 
 	const changing = fakeSession({ provider: "anthropic", id: "claude-opus-5" });
-	const casualModel = { provider: "openai-codex", id: "gpt-5.6-luna" };
+	const casualModel = { provider: "openai-codex", id: "gpt-6-luna" };
 	changing.ctx.model = casualModel;
 	await changing.handlers.get("model_select")?.({ model: casualModel }, changing.ctx);
 	if (changing.statuses.at(-1) !== "rotation: casual") failures.push(`model selection did not switch to casual: ${changing.statuses.at(-1)}`);
@@ -554,11 +554,11 @@ async function casualContextRegressionCase(): Promise<string[]> {
 	try {
 		cache.write([testQuota("anthropic", 80), testQuota("openai-codex", 100)]);
 		for (const tokens of [271_999, 272_000]) {
-			const casual = fakeSession({ provider: "openai-codex", id: "gpt-5.6-luna" }, [], tokens);
+			const casual = fakeSession({ provider: "openai-codex", id: "gpt-6-luna" }, [], tokens);
 			await casual.handlers.get("before_agent_start")?.({}, casual.ctx);
-			if (modelKey(casual) !== "openai-codex/gpt-5.6-luna") failures.push(`casual normal route changed at ${tokens} tokens: ${modelKey(casual)}`);
+			if (modelKey(casual) !== "openai-codex/gpt-6-luna") failures.push(`casual normal route changed at ${tokens} tokens: ${modelKey(casual)}`);
 			await casual.limit();
-			if (modelKey(casual) !== "opencode-go/gpt-5.6-luna") failures.push(`casual last resort changed at ${tokens} tokens: ${modelKey(casual)}`);
+			if (modelKey(casual) !== "opencode-go/gpt-6-luna") failures.push(`casual last resort changed at ${tokens} tokens: ${modelKey(casual)}`);
 		}
 	} finally {
 		cache.close();

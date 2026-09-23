@@ -51,7 +51,7 @@ Two modes, each a chain of hops in preference order:
 | mode | chain | last resort |
 |------|-------|-------------|
 | `frontier` | `anthropic/claude-opus-5` → `openai-codex/gpt-6-astra` | `opencode-go/kimi-k3` |
-| `casual` | `openai-codex/gpt-5.6-luna` | `opencode-go/gpt-5.6-luna` |
+| `casual` | `openai-codex/gpt-6-luna` | `opencode-go/gpt-6-luna` |
 
 The current model selects the mode at session start and whenever the model
 changes. A model in neither chain disables rotation. The last resort is entered
